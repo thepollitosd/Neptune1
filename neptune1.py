@@ -685,7 +685,7 @@ class SynthUI:
         self.root = root; self.synth = synth_instance; self.controls = {}
         self.string_vars = {}; self.scale_vars = {}; self.check_vars = {} # Added check_vars
         self._update_lock = False
-        self.root.title("PySynth Juno MIDI"); self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self.root.title("Neptune 1"); self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         self.synth.set_ui_update_callback(self.schedule_ui_update)
         style = ttk.Style(); style.theme_use('clam') # Or 'alt', 'default', 'classic'
         # Styles (optional, adjust as needed)
