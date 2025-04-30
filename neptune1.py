@@ -935,12 +935,6 @@ if __name__ == "__main__":
             if not available_ports: messagebox.showerror("MIDI Error", "No MIDI input devices found."); exit()
             port_list_str = "\n".join([f"{i}: {name}" for i, name in enumerate(available_ports)])
             result = available_ports[0]
-            if result is None: print("Cancelled."); exit()
-            try:
-                port_index = int(result)
-                if 0 <= port_index < len(available_ports): selected_port_name = available_ports[port_index]; print(f"Selected: '{selected_port_name}'")
-                else: messagebox.showwarning("Invalid", f"Index {port_index} OOR.", parent=root_check)
-            except ValueError: messagebox.showwarning("Invalid", f"'{result}' not number.", parent=root_check)
         except Exception as e: messagebox.showerror("MIDI Error", f"Scan error: {e}"); exit()
     root_check.destroy()
 
