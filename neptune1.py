@@ -934,8 +934,7 @@ if __name__ == "__main__":
             print("Scanning MIDI ports..."); available_ports = mido.get_input_names()
             if not available_ports: messagebox.showerror("MIDI Error", "No MIDI input devices found."); exit()
             port_list_str = "\n".join([f"{i}: {name}" for i, name in enumerate(available_ports)])
-            prompt = f"Available MIDI Ports:\n{port_list_str}\n\nEnter port number:"
-            result = simpledialog.askstring("MIDI Input", prompt, parent=root_check)
+            result = available_ports[0]
             if result is None: print("Cancelled."); exit()
             try:
                 port_index = int(result)
