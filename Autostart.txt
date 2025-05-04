@@ -1,0 +1,14 @@
+1. Open a terminal.
+
+2. Create an autostart file:
+nano ~/.config/autostart/neptune1.desktop
+
+3. Paste the following:
+[Desktop Entry]
+Type=Application
+Name=Neptune1
+Exec=python3 /home/pi/neptune1.py
+Comment=Start Neptune1 on boot
+X-GNOME-Autostart-enabled=true
+
+4. Save and exit (Ctrl + X, then Y, then Enter).
