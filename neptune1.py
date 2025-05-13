@@ -1,967 +1,617 @@
-# ... (Keep imports the same) ...
 import numpy as np
 import sounddevice as sd
-from scipy.signal import sawtooth, square, butter, lfilter, lfilter_zi
+from scipy.signal import butter, lfilter, lfilter_zi
 import time
 import math
 import mido
 import mido.backends.rtmidi
 import threading
-import queue
-import keyboard # Optional for external control
 import sys
 import traceback
-import random # Needed for arp random pattern
-from PIL import Image, ImageTk
-import tkinter as tk
-from tkinter import ttk
-from tkinter import simpledialog, messagebox
+import random
+try:
+    import RPi.GPIO as GPIO
+    RPI_GPIO_AVAILABLE = True
+except ImportError:
+    RPI_GPIO_AVAILABLE = False
+    print("RPi.GPIO library not found. Encoder functionality will be disabled.", file=sys.stderr)
+except RuntimeError:
+    RPI_GPIO_AVAILABLE = False
+    print("Error importing RPi.GPIO (may need sudo or not on RPi). Encoder functionality disabled.", file=sys.stderr)
 
-# --- Default Parameters (Added Arp Params) ---
+
+# --- Default Parameters ---
 DEFAULT_PARAMS = {
-    # Synth Core
     'osc_type': 'saw', 'attack': 0.01, 'decay': 0.2, 'sustain': 0.8, 'release': 0.3,
     'filter_cutoff': 5000, 'filter_resonance': 0.1, 'filter_env_amount': 0,
-    'lfo_rate': 0.0, 'lfo_depth': 0.0, 'lfo_target': 'pitch', 'lfo_shape': 'sine',
     'volume': 0.6, 'analog_drive': 1.0, 'analog_drift': 0.0000,
-    # FM
-    'fm_mod_freq_ratio': 1.0, 'fm_mod_depth': 100.0,
-    # Chorus FX
-    'chorus_depth': 0.005, 'chorus_rate': 0.5,
-    # --- Arpeggiator ---
-    'arp_on': False,        # Arp enabled/disabled
-    'arp_bpm': 120.0,       # Beats Per Minute
-    'arp_rate': 16,         # Note division (4=1/4, 8=1/8, 16=1/16, 32=1/32)
-    'arp_pattern': 'Up',    # 'Up', 'Down', 'UpDown', 'Random'
-    'arp_octaves': 1,       # Range (1-4)
-    # 'arp_gate': 0.95,     # Note length (optional, more complex to implement)
+    'chorus_depth': 0.005, 'chorus_rate': 0.5, # chorus_depth will be main control for "Chorus Amount"
+    'arp_on': False, 'arp_bpm': 120.0, 'arp_rate': 16,
+    'arp_pattern': 'Up', 'arp_octaves': 1,
 }
 
-# --- Presets (Using only Default for brevity, add yours back!) ---
+# --- Presets (REPLACE WITH YOUR 150 PRESETS) ---
 PRESETS = {
-    "Default": DEFAULT_PARAMS.copy() # Start with default values
-    # Add your other 150 presets back here!
-    # e.g., "Pad: MW Pad": { ... 'arp_on': False, 'arp_bpm': 120, ... },
+    "Default": DEFAULT_PARAMS.copy(),
+    "Pad: MW Pad": { 'osc_type': 'saw', 'attack': 0.8, 'decay': 1.5, 'sustain': 0.6, 'release': 1.8, 'filter_cutoff': 3800, 'filter_resonance': 0.1, 'filter_env_amount': 800, 'volume': 0.5, 'analog_drive': 1.5, 'analog_drift':0.0005, 'chorus_depth': 0.008, 'chorus_rate': 0.6, 'arp_on': False, 'arp_bpm': 120.0, 'arp_rate': 16, 'arp_pattern': 'Up', 'arp_octaves': 1},
+    # --- ADD YOUR OTHER PRESETS HERE ---
 }
 
-# --- Helper Functions (remain the same) ---
-def midi_to_freq(note):
-    return 432.0 * (2.0**((note - 69) / 12.0))
+# --- Helper Functions ---
+def midi_to_freq(note): return 432.0 * (2.0**((note - 69) / 12.0))
 
-# --- Voice Class (remain the same) ---
+# --- Voice Class ---
 class Voice:
-    # (Keep the entire Voice class exactly as it was in the previous version)
     def __init__(self, note, velocity, params, sample_rate):
-        self.note = note
-        self.velocity = velocity / 127.0
-        self.params = params # Expects a copy from the synth
-        self.sample_rate = sample_rate
-        self.freq = midi_to_freq(note) # Base carrier frequency
-        self.carrier_phase = 0.0
-        self.modulator_phase = 0.0 # For FM
-        self.envelope_stage = 'attack'
-        self.envelope_level = 0.0
-        self.time_in_stage = 0.0
-        self.release_start_level = 0.0
-        self.filter_b = None
-        self.filter_a = None
-        self.filter_zi = None
-        self._update_filter_coeffs(self.params['filter_cutoff'])
+        self.note = note; self.velocity = velocity / 127.0; self.params = params.copy()
+        self.sample_rate = sample_rate; self.freq = midi_to_freq(note)
+        self.carrier_phase = 0.0; self.envelope_stage = 'attack'
+        self.envelope_level = 0.0; self.time_in_stage = 0.0; self.release_start_level = 0.0
+        self.filter_b = None; self.filter_a = None; self.filter_zi = None
+        self._update_filter_coeffs(self.params.get('filter_cutoff', 5000))
         if self.filter_b is not None and self.filter_a is not None:
-            try:
-                self.filter_zi = lfilter_zi(self.filter_b, self.filter_a)
-                self.filter_zi = self.filter_zi.astype(np.float64)
+            try: self.filter_zi = lfilter_zi(self.filter_b, self.filter_a).astype(np.float64)
             except ValueError as e:
-                print(f"Warning: Init filter state failed: {e}", file=sys.stderr)
                 filter_order = max(len(self.filter_a), len(self.filter_b)) - 1
-                if filter_order > 0: self.filter_zi = np.zeros(filter_order, dtype=np.float64)
-                else: self.filter_zi = None
-        self.lfo_phase = np.random.rand() * 2 * np.pi
+                self.filter_zi = np.zeros(filter_order, dtype=np.float64) if filter_order > 0 else None
+            except Exception as e: self.filter_zi = None; print(f"Voice init filter zi error: {e}", file=sys.stderr)
         self.drift_lfo_phase = np.random.rand() * 2 * np.pi
 
     def _update_filter_coeffs(self, cutoff_hz):
-        p = self.params; sr = self.sample_rate; nyquist = sr / 2.0
-        cutoff_hz = np.clip(cutoff_hz, 20, nyquist * 0.99)
-        cutoff_norm = cutoff_hz / nyquist
-        try:
-            self.filter_b, self.filter_a = butter(2, cutoff_norm, btype='low', analog=False)
-        except ValueError as e:
-            print(f"Warning: butter failed cutoff {cutoff_hz}: {e}", file=sys.stderr)
-            self.filter_b, self.filter_a = butter(2, 0.98, btype='low', analog=False)
+        sr = self.sample_rate; nyquist = sr / 2.0
+        cutoff_hz = np.clip(cutoff_hz, 20, nyquist * 0.99); cutoff_norm = cutoff_hz / nyquist
+        try: self.filter_b, self.filter_a = butter(2, cutoff_norm, btype='low', analog=False)
+        except ValueError: self.filter_b, self.filter_a = butter(2, 0.98, btype='low', analog=False)
+        except Exception: self.filter_b, self.filter_a = None, None
 
     def process(self, num_samples):
         p = self.params; sr = self.sample_rate
-        lfo_block = np.zeros(num_samples)
-        if p['lfo_depth'] != 0 and p['lfo_rate'] > 0:
-            lfo_freq_rad = 2 * np.pi * p['lfo_rate'] / sr
-            t_phases = np.arange(self.lfo_phase, self.lfo_phase + num_samples * lfo_freq_rad, lfo_freq_rad)[:num_samples]
-            shape = p.get('lfo_shape', 'sine')
-            if shape == 'sine': lfo_block = np.sin(t_phases)
-            elif shape == 'triangle': lfo_block = 2.0 * (np.abs((t_phases / np.pi) % 2.0 - 1.0)) - 1.0
-            elif shape == 'saw': lfo_block = ((t_phases / np.pi) % 2.0) - 1.0
-            elif shape == 'square': lfo_block = np.sign(np.sin(t_phases))
-            self.lfo_phase = (t_phases[-1] + lfo_freq_rad) % (2 * np.pi)
-        drift_block = np.zeros(num_samples)
-        if p['analog_drift'] > 0:
+        drift_block = np.zeros(num_samples, dtype=np.float32)
+        if p.get('analog_drift',0.0) > 0:
             drift_lfo_rate = 0.15; drift_freq_rad = 2 * np.pi * drift_lfo_rate / sr
-            t_drift_phases = np.arange(self.drift_lfo_phase, self.drift_lfo_phase + num_samples * drift_freq_rad, drift_freq_rad)[:num_samples]
-            drift_block = np.sin(t_drift_phases)
-            self.drift_lfo_phase = (t_drift_phases[-1] + drift_freq_rad) % (2 * np.pi)
-        current_drift_block = drift_block * p['analog_drift'] * self.freq
-        lfo_val = np.mean(lfo_block) if p['lfo_rate'] > 0 else 0.0
-        lfo_target = p.get('lfo_target', 'pitch')
-        lfo_val_pitch = lfo_val if lfo_target == 'pitch' else 0.0
-        lfo_val_filter = lfo_val if lfo_target == 'filter' else 0.0
-        lfo_val_amp = lfo_val if lfo_target == 'amp' else 0.0
-        lfo_val_fm_depth = lfo_val if lfo_target == 'fm_depth' else 0.0
-        env_level = self.envelope_level; time_in_st = self.time_in_stage
-        carr_phase = self.carrier_phase; mod_phase = self.modulator_phase
-        attack_samples = max(1, int(p['attack'] * sr)); decay_samples = max(1, int(p['decay'] * sr))
-        release_samples = max(1, int(p['release'] * sr)); sustain_level = np.clip(p.get('sustain', 0.8), 0.0, 1.0)
+            t_drift_phases = np.arange(self.drift_lfo_phase, self.drift_lfo_phase + num_samples * drift_freq_rad, drift_freq_rad,dtype=np.float32)[:num_samples]
+            if len(t_drift_phases) == num_samples :
+                drift_block = np.sin(t_drift_phases); self.drift_lfo_phase = (t_drift_phases[-1] + drift_freq_rad) % (2 * np.pi)
+        current_drift_block = drift_block * p.get('analog_drift',0.0) * self.freq
+
+        env_level = self.envelope_level; time_in_st = self.time_in_stage; carr_phase = self.carrier_phase
+        attack_time = max(0.001, p['attack']); decay_time = max(0.001,p['decay']); release_time = max(0.001,p['release'])
+        attack_samples = int(attack_time * sr); decay_samples = int(decay_time * sr)
+        release_samples = int(release_time * sr); sustain_level = np.clip(p.get('sustain', 0.8), 0.0, 1.0)
         osc_phase_step_base = 2 * np.pi / sr; osc_type = p.get('osc_type', 'saw'); drive_gain = p.get('analog_drive', 1.0)
-        osc_output_block = np.zeros(num_samples); env_block = np.zeros(num_samples)
+        osc_output_block = np.zeros(num_samples, dtype=np.float32); env_block = np.zeros(num_samples, dtype=np.float32)
+
         for i in range(num_samples):
             if self.envelope_stage == 'attack':
-                env_level = min(1.0, time_in_st / attack_samples)
+                env_level = min(1.0, time_in_st / attack_samples if attack_samples > 0 else 1.0)
                 if time_in_st >= attack_samples: self.envelope_stage = 'decay'; env_level = 1.0; time_in_st = 0
             elif self.envelope_stage == 'decay':
-                env_level = sustain_level + (1.0 - sustain_level) * max(0.0, 1.0 - time_in_st / decay_samples)
+                env_level = sustain_level + (1.0 - sustain_level) * max(0.0, 1.0 - (time_in_st / decay_samples if decay_samples > 0 else 1.0))
                 if time_in_st >= decay_samples: self.envelope_stage = 'sustain'; env_level = sustain_level; time_in_st = 0
             elif self.envelope_stage == 'sustain': env_level = sustain_level
             elif self.envelope_stage == 'release':
-                env_level = self.release_start_level * max(0.0, 1.0 - time_in_st / release_samples)
+                env_level = self.release_start_level * max(0.0, 1.0 - (time_in_st / release_samples if release_samples > 0 else 1.0))
                 if time_in_st >= release_samples: self.envelope_stage = 'off'; env_level = 0.0
-            elif self.envelope_stage == 'off':
-                env_level = 0.0
-                if i == 0: osc_output_block.fill(0.0); env_block.fill(0.0)
-                else: osc_output_block[i:] = 0.0; env_block[i:] = 0.0
-                break
+            elif self.envelope_stage == 'off': env_level = 0.0
+            if env_level == 0 and self.envelope_stage == 'off':
+                if i == 0: osc_output_block.fill(0.0); env_block.fill(0.0); break
+                else: osc_output_block[i:] = 0.0; env_block[i:] = 0.0; break
             env_level = np.clip(env_level, 0.0, 1.0); env_block[i] = env_level
             if self.envelope_stage != 'sustain' and self.envelope_stage != 'off': time_in_st += 1
-            current_drift = current_drift_block[i]; pitch_lfo_mod = lfo_val_pitch * p['lfo_depth']
-            base_freq = max(1.0, self.freq + current_drift + pitch_lfo_mod)
-            osc_val = 0.0
-            if osc_type == 'fm':
-                modulator_freq = base_freq * p['fm_mod_freq_ratio']; modulator_phase_increment = modulator_freq * osc_phase_step_base
-                mod_phase = (mod_phase + modulator_phase_increment) % (2 * np.pi); modulator_output = np.sin(mod_phase)
-                current_mod_depth = p['fm_mod_depth'] * env_level
-                if lfo_target == 'fm_depth':
-                     fm_lfo_mod_factor = 1.0 + p['lfo_depth'] * lfo_val_fm_depth * 0.5
-                     current_mod_depth *= max(0.0, fm_lfo_mod_factor)
-                freq_deviation = modulator_output * current_mod_depth; carrier_freq = max(1.0, base_freq + freq_deviation)
-                carrier_phase_increment = carrier_freq * osc_phase_step_base; carr_phase = (carr_phase + carrier_phase_increment) % (2 * np.pi)
-                osc_val = np.sin(carr_phase)
-            else:
-                carrier_phase_increment = base_freq * osc_phase_step_base; carr_phase = (carr_phase + carrier_phase_increment) % (2 * np.pi)
-                if osc_type == 'saw': osc_val = (carr_phase / np.pi) - 1.0
-                elif osc_type == 'square': osc_val = 1.0 if carr_phase < np.pi else -1.0
-                elif osc_type == 'sine': osc_val = np.sin(carr_phase)
-                elif osc_type == 'triangle': osc_val = 2.0 * (abs(carr_phase / np.pi - 1.0)) - 1.0
-                else: osc_val = 0.0
+
+            current_drift = current_drift_block[i]; base_freq = max(1.0, self.freq + current_drift)
+            osc_val = 0.0; carrier_phase_increment = base_freq * osc_phase_step_base; carr_phase = (carr_phase + carrier_phase_increment) % (2 * np.pi)
+            if osc_type == 'saw': osc_val = (carr_phase / np.pi) - 1.0
+            elif osc_type == 'square': osc_val = 1.0 if carr_phase < np.pi else -1.0
+            elif osc_type == 'sine': osc_val = np.sin(carr_phase)
+            elif osc_type == 'triangle': osc_val = 2.0 * (abs(carr_phase / np.pi - 1.0)) - 1.0
             if drive_gain > 1.0: osc_val = np.tanh(osc_val * drive_gain)
             osc_output_block[i] = osc_val
-        self.carrier_phase = carr_phase; self.modulator_phase = mod_phase
-        self.envelope_level = env_level; self.time_in_stage = time_in_st
+
+        self.carrier_phase = carr_phase; self.envelope_level = env_level; self.time_in_stage = time_in_st
         avg_env_level = np.mean(env_block); filter_mod = avg_env_level * p['filter_env_amount']
-        if lfo_target == 'filter': filter_mod += lfo_val_filter * p['lfo_depth']
-        dynamic_cutoff = p['filter_cutoff'] + filter_mod
-        self._update_filter_coeffs(dynamic_cutoff)
+        dynamic_cutoff = p['filter_cutoff'] + filter_mod; self._update_filter_coeffs(dynamic_cutoff)
         filtered_block = osc_output_block
-        if self.filter_b is not None and self.filter_a is not None and osc_type != 'fm':
+        if self.filter_b is not None and self.filter_a is not None:
             expected_zi_len = max(len(self.filter_a), len(self.filter_b)) - 1
             if expected_zi_len <= 0: self.filter_zi = None
             elif self.filter_zi is None or len(self.filter_zi) != expected_zi_len:
-                self.filter_zi = np.zeros(expected_zi_len, dtype=np.float64)
+                 try: self.filter_zi = np.zeros(expected_zi_len, dtype=np.float64)
+                 except Exception: self.filter_zi = None
             if self.filter_zi is not None:
                 if self.filter_zi.dtype != np.float64: self.filter_zi = self.filter_zi.astype(np.float64)
                 osc_output_block_64 = osc_output_block.astype(np.float64)
-                try:
-                    filtered_block_64, self.filter_zi = lfilter(self.filter_b, self.filter_a, osc_output_block_64, zi=self.filter_zi)
-                    filtered_block = filtered_block_64.astype(np.float32)
-                except ValueError as e:
-                     print(f"ERROR lfilter: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
-                     filtered_block = osc_output_block
-                     self.filter_zi = np.zeros(expected_zi_len, dtype=np.float64)
-        amp_mod = 1.0
-        if lfo_target == 'amp' and p['lfo_depth'] > 0:
-            amp_lfo_norm = (lfo_val_amp + 1.0) / 2.0
-            amp_mod = (1.0 - p['lfo_depth']) + (p['lfo_depth'] * amp_lfo_norm)
-            amp_mod = np.clip(amp_mod, 0.0, 1.0)
-        output = filtered_block * env_block * self.velocity * amp_mod * p['volume']
+                try: filtered_block_64, self.filter_zi = lfilter(self.filter_b, self.filter_a, osc_output_block_64, zi=self.filter_zi); filtered_block = filtered_block_64.astype(np.float32)
+                except ValueError: filtered_block = osc_output_block; self.filter_zi = np.zeros(expected_zi_len, dtype=np.float64) if expected_zi_len > 0 else None
+                except Exception: filtered_block = osc_output_block; self.filter_zi = np.zeros(expected_zi_len, dtype=np.float64) if expected_zi_len > 0 else None
+        output = filtered_block * env_block * self.velocity * p['volume']
         if self.envelope_stage == 'off' and len(output) > 0:
             off_indices = np.where(env_block <= 1e-6)[0]
             if len(off_indices) > 0: output[off_indices[0]:] = 0.0
         return output
-
     def note_off(self):
-        if self.envelope_stage != 'off' and self.envelope_stage != 'release':
-            self.release_start_level = self.envelope_level
-            self.envelope_stage = 'release'; self.time_in_stage = 0
-
+        if self.envelope_stage != 'off' and self.envelope_stage != 'release': self.release_start_level = self.envelope_level; self.envelope_stage = 'release'; self.time_in_stage = 0
     def is_active(self): return self.envelope_stage != 'off'
 
-
-# --- Synthesizer Class (Modified for Arp) ---
-class Neptune1:
-    def __init__(self, sample_rate=44100, block_size=512, max_voices=12):
-        self.sample_rate = sample_rate
-        self.block_size = block_size
-        self.max_voices = max_voices
-        self.params = DEFAULT_PARAMS.copy()
-        self.voices = []
-        self.lock = threading.Lock()
-        self.preset_names = list(PRESETS.keys())
-        self.current_preset_index = 0
-        self.current_preset_name = "Custom"
-        self.current_preset_name = self._find_preset_name(self.params)
-        self.ui_update_callback = None
-        self.chorus_lfo_phase = 0.0
-        max_chorus_delay_sec = 0.05
+# --- Synthesizer Class ---
+class PySynthJunoMIDI:
+    def __init__(self, sample_rate=44100, block_size=1024, max_voices=8):
+        self.sample_rate = sample_rate; self.block_size = block_size; self.max_voices = max_voices
+        self.params = DEFAULT_PARAMS.copy(); self.voices = []
+        self.lock = threading.Lock(); self.preset_names = list(PRESETS.keys())
+        self.current_preset_index = 0; self.current_preset_name = self._find_preset_name(self.params)
+        self.chorus_lfo_phase = 0.0; max_chorus_delay_sec = 0.05
         self.chorus_delay_line = np.zeros(int(sample_rate * max_chorus_delay_sec * 1.2), dtype=np.float32)
-        self.chorus_delay_ptr = 0
-        self.stream = None
-
-        # --- Arpeggiator State ---
-        self.held_notes = [] # List of currently physically held MIDI note numbers
-        self.held_note_velocities = {} # Store velocity per note
-        self._arp_thread = None
-        self._arp_thread_running = False
-        self._arp_step = 0
-        self._arp_last_played_note = None # The actual MIDI note number played by arp
-        self._arp_direction_updown = 1 # For UpDown pattern (1=up, -1=down)
-
+        self.chorus_delay_ptr = 0; self._chorus_on_depth = self.params.get('chorus_depth', 0.005) # Used for toggle
+        self.stream = None; self.held_notes = []; self.held_note_velocities = {}
+        self._arp_thread = None; self._arp_thread_running = False; self._arp_step = 0
+        self._arp_last_played_note = None; self._arp_direction_updown = 1
         try:
-            self.stream = sd.OutputStream(
-                samplerate=sample_rate, blocksize=block_size, channels=1,
-                callback=self._audio_callback, dtype='float32'
-            )
-            self.stream.start()
-            print("Audio stream started.")
-        except Exception as e:
-            print(f"FATAL ERROR initializing audio stream: {e}", file=sys.stderr)
-            raise
+            print("Available output devices:"); print(sd.query_devices())
+            usb_device_index = None; devices = sd.query_devices()
+            if devices is not None:
+                for i, device in enumerate(devices):
+                    if isinstance(device, dict) and 'USB Audio Device' in device.get('name', '') and device.get('max_output_channels', 0) > 0:
+                        usb_device_index = i; print(f"Found USB Audio: {device.get('name')} (Idx: {i})"); break
+            if usb_device_index is not None:
+                try: sd.default.device = usb_device_index; print(f"Attempting to use USB Audio Idx {usb_device_index}.")
+                except Exception as e_dev: print(f"Could not set default device: {e_dev}", file=sys.stderr)
+            self.stream = sd.OutputStream(samplerate=sample_rate, blocksize=block_size, channels=1, callback=self._audio_callback, dtype='float32')
+            self.stream.start(); print(f"Audio stream started on {self.stream.device} (Block: {self.stream.blocksize})")
+        except sd.PortAudioError as e: print(f"FATAL PortAudioError: {e}", file=sys.stderr); raise
+        except Exception as e: print(f"FATAL audio init error: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); raise
 
-    # --- Methods unchanged: set_ui_update_callback, _trigger_ui_update, _find_preset_name ---
-    def set_ui_update_callback(self, callback): self.ui_update_callback = callback
-    def _trigger_ui_update(self):
-        if self.ui_update_callback:
-            try: self.ui_update_callback()
-            except Exception as e: print(f"Error UI callback: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
     def _find_preset_name(self, params_to_find):
         for i, name in enumerate(self.preset_names):
             preset_params = PRESETS[name]; match = True
-            for key in preset_params:
-                 if key not in params_to_find or params_to_find[key] != preset_params[key]: match = False; break
-            if not match: continue
-            full_preset_params = DEFAULT_PARAMS.copy(); full_preset_params.update(preset_params)
             for key in DEFAULT_PARAMS:
-                 # Include check for arp defaults if needed
-                 if key not in params_to_find or params_to_find[key] != full_preset_params[key]: match = False; break
-            if match: self.current_preset_index = i; return name
-        if self.current_preset_name != "Custom":
-            try: self.current_preset_index = self.preset_names.index(self.current_preset_name)
-            except ValueError: self.current_preset_index = 0
-        else: self.current_preset_index = 0
-        return "Custom"
+                if params_to_find.get(key, DEFAULT_PARAMS[key]) != preset_params.get(key, DEFAULT_PARAMS[key]): match=False; break
+            if match: self.current_preset_index=i; return name
+        self.current_preset_index=0; return "Custom"
 
-
-    # --- Modified set_params to handle arp on/off ---
     def set_params(self, params_dict, source="unknown"):
-        arp_state_changed = False
-        old_arp_on = self.params.get('arp_on', False)
-
+        arp_state_changed = False; old_arp_on = self.params.get('arp_on', False)
         with self.lock:
             changed = False
             for key, value in params_dict.items():
                 if key in self.params:
                     try:
-                        current_value = self.params[key]
-                        new_value = value # Assign first
-
-                        # Attempt type conversion based on default type
-                        default_type = type(DEFAULT_PARAMS.get(key, ''))
-                        current_type = type(current_value)
-                        if default_type == bool and not isinstance(new_value, bool):
-                            new_value = str(value).lower() in ('true', '1', 't', 'yes', 'on')
-                        elif default_type == float and not isinstance(new_value, float):
-                            new_value = float(value)
-                        elif default_type == int and not isinstance(new_value, int):
-                             # Handle arp_rate/octaves carefully
-                             if key in ['arp_rate', 'arp_octaves']:
-                                 new_value = int(float(value)) # Allow float input from scale but store as int
-                             else:
-                                 new_value = int(value)
-                        elif default_type == str and not isinstance(new_value, str):
-                             new_value = str(value)
-
-                        # Check if value actually changed
+                        current_value = self.params[key]; new_value = value
+                        default_type = type(DEFAULT_PARAMS.get(key, type(None)))
+                        if default_type == bool and not isinstance(new_value, bool): new_value = str(value).lower() in ('true', '1', 't', 'yes', 'on')
+                        elif default_type == float and not isinstance(new_value, (float, int)): new_value = float(value)
+                        elif default_type == int and not isinstance(new_value, int): new_value = int(float(value))
+                        elif default_type == str and not isinstance(new_value, str): new_value = str(value)
                         if new_value != current_value:
-                            self.params[key] = new_value
-                            changed = True
-                            if key == 'arp_on':
-                                arp_state_changed = True
-                    except Exception as e:
-                        print(f"Warn: Set param '{key}'='{value}' fail: {e}", file=sys.stderr)
-
+                            if key == 'chorus_depth' and new_value > 0: self._chorus_on_depth = new_value # Store if being set by slider
+                            self.params[key] = new_value; changed = True
+                            if key == 'arp_on': arp_state_changed = True
+                    except (ValueError, TypeError) as e: print(f"Warn: Param conversion {key}={value}: {e}", file=sys.stderr)
+                    except Exception as e: print(f"Warn: Set param {key}={value}: {e}", file=sys.stderr)
             if changed:
-                current_params_copy = self.params.copy()
-                for voice in self.voices:
-                    voice.params = current_params_copy # Update voices
+                try:
+                    current_params_copy = self.params.copy()
+                    for voice in self.voices: voice.params = current_params_copy.copy()
+                except Exception as e: print(f"Error updating voice params: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
                 self.current_preset_name = self._find_preset_name(self.params)
-                self._trigger_ui_update() # Update UI
-
-        # --- Start/Stop Arp Thread outside lock if state changed ---
         if arp_state_changed:
             new_arp_on = self.params.get('arp_on', False)
-            if new_arp_on and not old_arp_on:
-                self._start_arp_thread()
-            elif not new_arp_on and old_arp_on:
-                self._stop_arp_thread()
+            if new_arp_on and not old_arp_on: self._start_arp_thread()
+            elif not new_arp_on and old_arp_on: self._stop_arp_thread()
 
-    # --- Methods unchanged: load_preset, _apply_master_chorus, _audio_callback ---
+    def toggle_volume_mute(self): # Function to be called by encoder switch
+        with self.lock:
+            if not hasattr(self, 'is_volume_muted'): self.is_volume_muted = False
+            if not hasattr(self, '_stored_volume'): self._stored_volume = self.params['volume']
+
+            if not self.is_volume_muted:
+                self._stored_volume = self.params['volume']
+                self.params['volume'] = 0.0
+                self.is_volume_muted = True
+                print("Volume Muted")
+            else:
+                self.params['volume'] = self._stored_volume
+                self.is_volume_muted = False
+                print(f"Volume Unmuted: {self.params['volume']:.2f}")
+            # Update voices
+            current_params_copy = self.params.copy()
+            for voice in self.voices: voice.params = current_params_copy.copy()
+            self.current_preset_name = self._find_preset_name(self.params) # Becomes "Custom"
+
+
+    def toggle_chorus(self): # Called by "Chorus Amount" encoder switch
+        with self.lock: changed = False; current_depth = self.params.get('chorus_depth', 0.0)
+        if current_depth > 0:
+            # self._chorus_on_depth = current_depth # No need to store again, slider sets this
+            self.params['chorus_depth'] = 0.0; print("Chorus OFF by Switch"); changed = True
+        else:
+            restore_depth = self._chorus_on_depth if self._chorus_on_depth > 0 else 0.005
+            self.params['chorus_depth'] = restore_depth; print(f"Chorus ON by Switch (Depth: {restore_depth:.3f})"); changed = True
+        if changed:
+             try:
+                 with self.lock: current_params_copy = self.params.copy()
+                 for voice in self.voices: voice.params = current_params_copy.copy()
+             except Exception as e: print(f"Error updating voice params (chorus toggle): {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+             self.current_preset_name = self._find_preset_name(self.params)
+
     def load_preset(self, preset_name_or_index):
         preset_to_load = None; preset_name = "Unknown"; target_index = -1
-        if isinstance(preset_name_or_index, int):
-            if 0 <= preset_name_or_index < len(self.preset_names):
-                target_index = preset_name_or_index; preset_name = self.preset_names[target_index]; preset_to_load = PRESETS[preset_name]
-            else: print(f"Warn: Preset index {preset_name_or_index} OOR.", file=sys.stderr); return False
-        elif isinstance(preset_name_or_index, str):
-            if preset_name_or_index in PRESETS:
-                 preset_name = preset_name_or_index; preset_to_load = PRESETS[preset_name]
-                 try: target_index = self.preset_names.index(preset_name)
-                 except ValueError: target_index = -1
-            else: print(f"Warn: Preset '{preset_name_or_index}' not found.", file=sys.stderr); return False
-        else: print("Warn: Invalid preset identifier.", file=sys.stderr); return False
+        try:
+            if isinstance(preset_name_or_index, int):
+                if 0 <= preset_name_or_index < len(self.preset_names): target_index = preset_name_or_index; preset_name = self.preset_names[target_index]; preset_to_load = PRESETS[preset_name]
+                else: print(f"Warn: Idx {preset_name_or_index} OOR.", file=sys.stderr); return False
+            elif isinstance(preset_name_or_index, str):
+                if preset_name_or_index in PRESETS: preset_name = preset_name_or_index; preset_to_load = PRESETS[preset_name]; target_index = self.preset_names.index(preset_name)
+                else: print(f"Warn: Preset '{preset_name_or_index}' not found.", file=sys.stderr); return False
+            else: print("Warn: Invalid preset ID.", file=sys.stderr); return False
+        except Exception as e: print(f"Error finding preset {preset_name_or_index}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); return False
         if preset_to_load:
-            print(f"\nLoading preset {target_index}: {preset_name}")
-            new_params = DEFAULT_PARAMS.copy(); new_params.update(preset_to_load)
-            self.set_params(new_params, source="load_preset") # This handles UI update and arp thread now
-            self.current_preset_index = target_index; self.current_preset_name = preset_name
-            self._trigger_ui_update(); return True # Ensure final name/index is set
+            print(f"\nLoading preset {target_index if target_index !=-1 else ''}: {preset_name}")
+            new_params = DEFAULT_PARAMS.copy()
+            for k, v in preset_to_load.items():
+                if k in new_params: new_params[k] = v # Only update known keys
+            self._chorus_on_depth = new_params.get('chorus_depth', 0.005) # Store loaded depth
+            self.set_params(new_params, source="load_preset")
+            self.current_preset_index = target_index; self.current_preset_name = preset_name; return True
         return False
 
     def _apply_master_chorus(self, signal):
-        p = self.params; sr = self.sample_rate; chorus_depth = p.get('chorus_depth', 0.0); chorus_rate = p.get('chorus_rate', 0.0)
-        if chorus_depth <= 0 or chorus_rate <= 0: return signal
-        lfo_freq_rad = 2 * np.pi * chorus_rate / sr; num_samples = len(signal); dl_len = len(self.chorus_delay_line)
-        t = np.arange(self.chorus_lfo_phase, self.chorus_lfo_phase + num_samples * lfo_freq_rad, lfo_freq_rad)[:num_samples]
-        chorus_lfo_signal = np.sin(t); self.chorus_lfo_phase = (t[-1] + lfo_freq_rad) % (2*np.pi)
-        base_delay_sec = 0.015; delay_sec = base_delay_sec + chorus_lfo_signal * chorus_depth / 2.0
-        min_delay_sec = 0.001; max_delay_sec = (dl_len / sr) * 0.95; delay_sec = np.clip(delay_sec, min_delay_sec, max_delay_sec)
-        delay_samples = delay_sec * sr; delayed_output = np.zeros_like(signal); write_ptr = self.chorus_delay_ptr
-        for i in range(num_samples):
-            self.chorus_delay_line[write_ptr] = signal[i]
-            read_ptr_float = (write_ptr - delay_samples[i] + dl_len) % dl_len; read_ptr_int = int(np.floor(read_ptr_float))
-            read_ptr_frac = read_ptr_float - read_ptr_int; read_ptr_next = (read_ptr_int + 1) % dl_len
-            delayed_sample = (1.0 - read_ptr_frac) * self.chorus_delay_line[read_ptr_int] + read_ptr_frac * self.chorus_delay_line[read_ptr_next]
-            delayed_output[i] = delayed_sample; write_ptr = (write_ptr + 1) % dl_len
-        self.chorus_delay_ptr = write_ptr; return 0.6 * signal + 0.4 * delayed_output
+        try:
+            p = self.params; sr = self.sample_rate; chorus_depth = p.get('chorus_depth', 0.0); chorus_rate = p.get('chorus_rate', 0.0)
+            if chorus_depth <= 0 or chorus_rate <= 0: return signal # Chorus is off if depth is 0
+            lfo_freq_rad = 2 * np.pi * chorus_rate / sr; num_samples = len(signal); dl_len = len(self.chorus_delay_line)
+            if dl_len == 0: return signal
+            t = np.arange(self.chorus_lfo_phase, self.chorus_lfo_phase + num_samples * lfo_freq_rad, lfo_freq_rad, dtype=np.float32)[:num_samples]
+            if len(t) < num_samples: t = np.pad(t, (0, num_samples - len(t)), 'edge')
+            chorus_lfo_signal = np.sin(t); self.chorus_lfo_phase = (t[-1] + lfo_freq_rad) % (2*np.pi)
+            base_delay_sec = 0.015; delay_sec = base_delay_sec + chorus_lfo_signal * chorus_depth / 2.0
+            min_delay_sec = 0.001; max_delay_sec = (dl_len / sr) * 0.95; delay_sec = np.clip(delay_sec, min_delay_sec, max_delay_sec)
+            delay_samples = delay_sec * sr; delayed_output = np.zeros_like(signal); write_ptr = self.chorus_delay_ptr
+            for i in range(num_samples):
+                self.chorus_delay_line[write_ptr] = signal[i]
+                read_ptr_float = (write_ptr - delay_samples[i] + dl_len) % dl_len; read_ptr_int = int(np.floor(read_ptr_float))
+                read_ptr_frac = read_ptr_float - read_ptr_int; read_ptr_next = (read_ptr_int + 1) % dl_len
+                delayed_sample = (1.0 - read_ptr_frac) * self.chorus_delay_line[read_ptr_int] + read_ptr_frac * self.chorus_delay_line[read_ptr_next]
+                delayed_output[i] = delayed_sample; write_ptr = (write_ptr + 1) % dl_len
+            self.chorus_delay_ptr = write_ptr; return 0.6 * signal + 0.4 * delayed_output
+        except Exception as e: print(f"Error in chorus processing: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); return signal
 
     def _audio_callback(self, outdata, frames, time_info, status):
         if status: print("Audio CB status:", status, file=sys.stderr)
         buffer = np.zeros((frames, 1), dtype=np.float32)
-        with self.lock:
-            active_voices_next = []; voices_to_process = self.voices[:]
-            if not voices_to_process: outdata[:] = buffer; return
-            for voice in voices_to_process:
-                if voice.is_active():
-                    try:
-                        voice_output = voice.process(frames); buffer[:, 0] += voice_output
-                        if voice.is_active(): active_voices_next.append(voice)
-                    except Exception as e: print(f"ERR voice {voice.note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
-            self.voices = active_voices_next
-        try: buffer[:, 0] = self._apply_master_chorus(buffer[:, 0])
-        except Exception as e: print(f"ERR chorus: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
-        max_amp = np.max(np.abs(buffer));
-        if max_amp > 1.0: np.clip(buffer, -1.0, 1.0, out=buffer)
-        outdata[:] = buffer
-
-    # --- Note On/Off (Modified for Arp) ---
-    def note_on(self, note, velocity):
-        """Handles MIDI Note On messages, considering the arpeggiator state."""
-        with self.lock:
-            arp_on = self.params.get('arp_on', False)
-            if arp_on:
-                # Arp is on: Add note to held list if not already present
-                if note not in self.held_notes:
-                    self.held_notes.append(note)
-                    self.held_notes.sort() # Keep sorted for patterns
-                    self.held_note_velocities[note] = velocity
-                    # print(f"Arp Held Notes: {self.held_notes}") # Debug
-            else:
-                # Arp is off: Trigger voice directly
-                self._trigger_voice_on(note, velocity)
-
-    def note_off(self, note):
-        """Handles MIDI Note Off messages, considering the arpeggiator state."""
-        with self.lock:
-            arp_on = self.params.get('arp_on', False)
-            if arp_on:
-                # Arp is on: Remove note from held list
-                if note in self.held_notes:
-                    self.held_notes.remove(note)
-                    # No need to sort again after removal
-                    if note in self.held_note_velocities:
-                        del self.held_note_velocities[note]
-                    # print(f"Arp Held Notes: {self.held_notes}") # Debug
-                # If no notes are held anymore, stop the last arp note
-                if not self.held_notes and self._arp_last_played_note is not None:
-                    self._arp_stop_note(self._arp_last_played_note)
-                    self._arp_last_played_note = None
-                    self._arp_step = 0 # Reset step
-                    self._arp_direction_updown = 1 # Reset direction
-            else:
-                # Arp is off: Trigger voice off directly
-                self._trigger_voice_off(note)
-
-    def _trigger_voice_on(self, note, velocity):
-        """Internal method to actually start a synth voice (used by note_on and arp)."""
-        # Assumes lock is already held
-        if len(self.voices) >= self.max_voices:
-            self.voices.pop(0)
         try:
-            self.voices.append(Voice(note, velocity, self.params.copy(), self.sample_rate))
-        except Exception as e:
-            print(f"ERR voice note {note}: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
+            with self.lock:
+                active_voices_next = []; voices_to_process = self.voices[:]
+                if not voices_to_process: outdata[:] = buffer; return
+                for voice in voices_to_process:
+                    if voice.is_active():
+                        try: voice_output = voice.process(frames); buffer[:, 0] += voice_output;
+                        if voice.is_active(): active_voices_next.append(voice)
+                        except Exception as e: print(f"ERR voice {voice.note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+                self.voices = active_voices_next
+            try: buffer[:, 0] = self._apply_master_chorus(buffer[:, 0])
+            except Exception as e: print(f"ERR chorus in CB: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+            max_amp = np.max(np.abs(buffer));
+            if max_amp > 1.0: np.clip(buffer, -1.0, 1.0, out=buffer)
+            outdata[:] = buffer
+        except Exception as e: print(f"FATAL Error in audio callback: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); outdata.fill(0)
 
+    def note_on(self, note, velocity):
+        with self.lock:
+            arp_on = self.params.get('arp_on', False)
+            if arp_on:
+                if note not in self.held_notes: self.held_notes.append(note); self.held_notes.sort(); self.held_note_velocities[note] = velocity
+            else:
+                try: self._trigger_voice_on(note, velocity)
+                except Exception as e: print(f"Error triggering voice on {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+    def note_off(self, note):
+         with self.lock:
+            arp_on = self.params.get('arp_on', False)
+            if arp_on:
+                if note in self.held_notes: self.held_notes.remove(note);
+                if note in self.held_note_velocities: del self.held_note_velocities[note]
+            else:
+                 try: self._trigger_voice_off(note)
+                 except Exception as e: print(f"Error triggering voice off {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+    def _trigger_voice_on(self, note, velocity):
+        if len(self.voices) >= self.max_voices: self.voices.pop(0)
+        try: self.voices.append(Voice(note, velocity, self.params.copy(), self.sample_rate))
+        except Exception as e: print(f"ERR creating voice for note {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
     def _trigger_voice_off(self, note):
-        """Internal method to actually stop a synth voice (used by note_off and arp)."""
-        # Assumes lock is already held
-        for voice in self.voices:
-            if voice.note == note and voice.envelope_stage not in ['release', 'off']:
-                voice.note_off()
-                break # Stop first matching voice
+        try:
+            for voice in self.voices:
+                if voice.note == note and voice.envelope_stage not in ['release', 'off']: voice.note_off(); break
+        except Exception as e: print(f"Error finding/stopping voice for note {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
 
-    # --- Methods unchanged: control_change, close ---
-    def control_change(self, control, value):
-        new_params = {}
-        if control == 71: new_params['filter_resonance'] = np.clip((value / 127.0) * 0.95, 0.0, 0.95)
-        elif control == 1:
-             target = self.params.get('lfo_target', 'pitch'); max_depth = 0.0
-             if target == 'pitch': max_depth = 12.0
-             elif target == 'filter': max_depth = 6000.0
-             elif target == 'amp': max_depth = 1.0
-             elif target == 'fm_depth': max_depth = 2.0
-             new_params['lfo_depth'] = (value / 127.0) * max_depth
-        elif control == 7: new_params['volume'] = (value / 127.0) * 0.8
-        elif control == 75: min_r, max_r = 0.1, 16.0; new_params['fm_mod_freq_ratio'] = min_r * (max_r / min_r)**(value / 127.0)
-        elif control == 76: new_params['fm_mod_depth'] = (value / 127.0) * 2500.0
-        elif control == 73: min_a, max_a = 0.001, 4.0; new_params['attack'] = min_a * (max_a / min_a)**(value / 127.0)
-        elif control == 72: min_rl, max_rl = 0.01, 6.0; new_params['release'] = min_rl * (max_rl / min_rl)**(value / 127.0)
-        # Add CCs for Arp params? e.g., CC 80 for Arp Rate, CC 81 for Arp Pattern
-        # elif control == 80: new_params['arp_rate'] = [4, 8, 16, 32][value // 32] # Map 0-127 to 4 rates
-        # elif control == 81: new_params['arp_pattern'] = ['Up', 'Down', 'UpDown', 'Random'][value // 32]
-        if new_params: self.set_params(new_params, source="midi_cc")
+    def control_change(self, control, value): pass # No MIDI CCs handled directly if encoders are primary
 
     def close(self):
-        print("Stopping synth...")
-        self._stop_arp_thread() # Ensure arp thread is stopped first
+        print("Stopping synth...");
+        try: self._stop_arp_thread()
+        except Exception as e: print(f"Error stopping arp thread: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
         print("Stopping audio stream...")
         if self.stream:
             try: self.stream.stop(); self.stream.close()
-            except Exception as e: print(f"Error closing audio stream: {e}", file=sys.stderr)
+            except sd.PortAudioError as e: print(f"PortAudioError closing audio stream: {e}", file=sys.stderr)
+            except Exception as e: print(f"Error closing audio stream: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
         self.stream = None; print("Audio stream stopped.")
-
-# --- Arpeggiator Logic ---
     def _start_arp_thread(self):
-        # (Keep this method the same)
-        if self._arp_thread is not None and self._arp_thread.is_alive():
-            print("Arp thread already running.")
-            return
-        self._arp_thread_running = True
-        self._arp_step = 0 # Reset step counter
-        self._arp_direction_updown = 1 # Reset direction for UpDown
-        self._arp_last_played_note = None
-        self._arp_thread = threading.Thread(target=self._arp_sequencer_loop, daemon=True)
-        self._arp_thread.start()
-        print("Arpeggiator thread started.")
-
+        if self._arp_thread is not None and self._arp_thread.is_alive(): return
+        try:
+            self._arp_thread_running = True; self._arp_step = 0; self._arp_direction_updown = 1; self._arp_last_played_note = None
+            self._arp_thread = threading.Thread(target=self._arp_sequencer_loop, daemon=True); self._arp_thread.start()
+            print("Arp thread started.")
+        except Exception as e: print(f"Failed to start arp thread: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); self._arp_thread_running = False
     def _stop_arp_thread(self):
-        # (Keep this method the same)
-        if self._arp_thread is None or not self._arp_thread.is_alive():
-            return
-        self._arp_thread_running = False
-        print("Waiting for arpeggiator thread to finish...")
-        self._arp_thread.join(timeout=1.0)
-        if self._arp_thread.is_alive():
-            print("Warning: Arp thread did not exit cleanly.", file=sys.stderr)
-        else:
-            print("Arpeggiator thread stopped.")
-        self._arp_thread = None
-        with self.lock:
-            if self._arp_last_played_note is not None:
-                self._arp_stop_note(self._arp_last_played_note)
-                self._arp_last_played_note = None
-
+        if self._arp_thread is None or not self._arp_thread.is_alive(): return
+        try:
+            self._arp_thread_running = False; print("Waiting for arp thread...")
+            self._arp_thread.join(timeout=0.5)
+            if self._arp_thread.is_alive(): print("Warn: Arp thread join timed out.", file=sys.stderr)
+            else: print("Arp thread stopped.")
+            self._arp_thread = None
+            with self.lock:
+                if self._arp_last_played_note is not None: self._arp_stop_note(self._arp_last_played_note); self._arp_last_played_note = None
+        except Exception as e: print(f"Error stopping arp thread cleanly: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); self._arp_thread = None
     def _arp_sequencer_loop(self):
-        """The main loop for the arpeggiator thread."""
         while self._arp_thread_running:
             try:
-                # Get current arp settings (copy to avoid race conditions)
                 with self.lock:
-                    arp_on = self.params.get('arp_on', False)
-                    bpm = self.params.get('arp_bpm', 120.0)
-                    rate = self.params.get('arp_rate', 16)
-                    pattern = self.params.get('arp_pattern', 'Up')
-                    octaves = self.params.get('arp_octaves', 1)
-                    # Get sorted copy of physically held notes
-                    local_held_notes = sorted(self.held_notes)
-
+                    arp_on = self.params.get('arp_on', False); bpm = self.params.get('arp_bpm', 120.0)
+                    rate = self.params.get('arp_rate', 16); pattern = self.params.get('arp_pattern', 'Up')
+                    octaves = self.params.get('arp_octaves', 1); local_held_notes = sorted(self.held_notes)
                 if not arp_on or not local_held_notes:
-                    # If arp turned off or no notes held, sleep briefly and check again
-                    # Also, ensure any last playing arp note is stopped if notes released
                     if not local_held_notes and self._arp_last_played_note is not None:
-                         with self.lock:
-                             self._arp_stop_note(self._arp_last_played_note)
-                    time.sleep(0.05) # Shorter sleep when inactive
-                    continue
-
-                # Calculate step duration
-                if bpm <= 0 or rate <= 0:
-                    time.sleep(0.1) # Avoid division by zero or invalid rate
-                    continue
-                steps_per_beat = rate / 4.0 # e.g., rate 16 -> 4 steps per beat
-                beats_per_second = bpm / 60.0
-                steps_per_second = steps_per_beat * beats_per_second
-                step_duration_seconds = 1.0 / steps_per_second
-
-                # --- Determine the sequence of notes to play ---
-                note_sequence = []
-                num_held = len(local_held_notes)
-
-                # *** MODIFICATION START: Handle single note case ***
+                         with self.lock: self._arp_stop_note(self._arp_last_played_note)
+                    time.sleep(0.05); continue
+                if bpm <= 0 or rate <= 0: time.sleep(0.1); continue
+                steps_per_beat = rate / 4.0; beats_per_second = bpm / 60.0
+                steps_per_second = steps_per_beat * beats_per_second; step_duration_seconds = 1.0 / steps_per_second
+                note_sequence = []; num_held = len(local_held_notes)
+                effective_pattern = pattern
                 if num_held == 1:
                     base_note = local_held_notes[0]
+                    for o in range(octaves): note_sequence.append(base_note + o * 12)
+                    effective_pattern = 'Up'
+                else:
                     for o in range(octaves):
-                        note_sequence.append(base_note + o * 12)
-                    # Pattern is irrelevant for single note, just cycle through octaves
-                    pattern = 'Up' # Force 'Up' logic for cycling
-                # *** MODIFICATION END ***
-                else: # Original logic for multiple notes
-                    for o in range(octaves):
-                        for note in local_held_notes:
-                            note_sequence.append(note + o * 12)
-
-                if not note_sequence:
-                     time.sleep(0.05); continue # Should not happen if local_held_notes has items
-
-                # --- Apply Pattern to select note ---
-                current_note_to_play = None
-                seq_len = len(note_sequence)
-
-                # Ensure step is valid even if note sequence length changed drastically
-                current_step = self._arp_step
-
-                if pattern == 'Up':
-                    step_index = current_step % seq_len
-                    current_note_to_play = note_sequence[step_index]
-                elif pattern == 'Down':
-                    step_index = current_step % seq_len
-                    current_note_to_play = note_sequence[seq_len - 1 - step_index]
-                elif pattern == 'UpDown':
-                     # Total steps in one full cycle (e.g., 0,1,2,1 for seq_len=3 -> 4 steps)
-                    effective_len = max(1, seq_len * 2 - 2) if seq_len > 1 else 1
-                    step_index = current_step % effective_len
-                    if step_index < seq_len: # Going up
-                        current_note_to_play = note_sequence[step_index]
-                    else: # Going down (excluding endpoints repeated)
-                         # Index calculation: effective_len - step_index gives index from the end *backwards*
-                         # e.g. len=3 (notes 0,1,2), eff_len=4. steps 0,1,2,3
-                         # step 3: 4 - 3 = 1 -> index 1 (note 1)
-                         current_note_to_play = note_sequence[effective_len - step_index]
-
-                elif pattern == 'Random':
-                    current_note_to_play = random.choice(note_sequence)
-                else: # Default to 'Up' if pattern is unknown
-                    step_index = current_step % seq_len
-                    current_note_to_play = note_sequence[step_index]
-
-                # --- Play the note ---
+                        for note in local_held_notes: note_sequence.append(note + o * 12)
+                if not note_sequence: time.sleep(0.05); continue
+                current_note_to_play = None; seq_len = len(note_sequence); current_step = self._arp_step
+                if effective_pattern == 'Up': step_index = current_step % seq_len; current_note_to_play = note_sequence[step_index]
+                elif effective_pattern == 'Down': step_index = current_step % seq_len; current_note_to_play = note_sequence[seq_len - 1 - step_index]
+                elif effective_pattern == 'UpDown':
+                     effective_len = max(1, seq_len * 2 - 2) if seq_len > 1 else 1; step_index = current_step % effective_len
+                     if step_index < seq_len: current_note_to_play = note_sequence[step_index]
+                     else: current_note_to_play = note_sequence[effective_len - step_index]
+                elif effective_pattern == 'Random': current_note_to_play = random.choice(note_sequence)
+                else: step_index = current_step % seq_len; current_note_to_play = note_sequence[step_index]
                 if current_note_to_play is not None:
-                    # Find original velocity if possible
-                    original_base_note = local_held_notes[0] # Use first held note's octave base
-                    note_in_base_octave = current_note_to_play % 12 + (original_base_note // 12) * 12
-                    # Try to find the velocity for the specific note in its original octave among held notes
-                    velocity = self.held_note_velocities.get(note_in_base_octave, 100) # Default velocity 100
-
-                    with self.lock: # Lock needed for triggering voices
-                         self._arp_play_note(current_note_to_play, velocity)
-                    self._arp_step += 1 # Increment step only after successfully playing
-
-                # --- Sleep for the step duration ---
-                sleep_time = step_duration_seconds
-                time.sleep(sleep_time)
-
-            except Exception as e:
-                print(f"Error in arp sequencer loop: {e}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-                time.sleep(0.5) # Avoid busy-looping on error
-
+                    original_base_note_candidate = local_held_notes[current_step % num_held if num_held > 0 else 0]
+                    velocity = self.held_note_velocities.get(original_base_note_candidate, 100)
+                    with self.lock: self._arp_play_note(current_note_to_play, velocity)
+                    self._arp_step += 1
+                sleep_time = step_duration_seconds; time.sleep(sleep_time)
+            except Exception as e: print(f"ERR arp loop: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); time.sleep(0.5)
     def _arp_play_note(self, note, velocity):
-        """Internal: Stops previous arp note and plays the new one.
-           Corrected to always stop/start for retriggering.
-        """
-        # Assumes lock is held
-
-        # --- FIX: Always stop the previously played arp note ---
-        # Stop whatever note the arp played last, regardless of the new note number.
-        if self._arp_last_played_note is not None:
-            self._arp_stop_note(self._arp_last_played_note)
-
-        # --- Always Trigger the new note ON ---
-        # Since we stopped the previous one, we always want to start the new one.
-        # The _trigger_voice_on handles voice limits etc.
-        self._trigger_voice_on(note, velocity)
-
-
-        # --- Update the last played note ---
-        self._arp_last_played_note = note # Remember this note was the last one played by arp
-
-
+        try:
+            if self._arp_last_played_note is not None: self._arp_stop_note(self._arp_last_played_note)
+            self._trigger_voice_on(note, velocity); self._arp_last_played_note = note
+        except Exception as e: print(f"Error in _arp_play_note for note {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
     def _arp_stop_note(self, note):
-        # (Keep this method the same)
-        # Assumes lock is held
-        self._trigger_voice_off(note)
-        # Only clear last played note if it's the one we just stopped
-        if self._arp_last_played_note == note:
-             self._arp_last_played_note = None
+        try:
+            self._trigger_voice_off(note)
+            if self._arp_last_played_note == note: self._arp_last_played_note = None
+        except Exception as e: print(f"Error in _arp_stop_note for note {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
 
-# (The rest of the code, including Neptune1's other methods,
-#  PARAM_CONFIG, helper functions, SynthUI class, midi_listener,
-#  and the main execution block, remains exactly the same as before)
-# --- Parameter Definitions for UI (Added Arp Params) ---
-PARAM_CONFIG = {
-    # Synth Core
-    'Preset':       {'type': 'preset'},
-    'osc_type':     {'type': 'options', 'options': ['saw', 'square', 'sine', 'triangle', 'fm']},
-    'attack':       {'type': 'log', 'min': 0.001, 'max': 5.0},
-    'decay':        {'type': 'log', 'min': 0.01, 'max': 5.0},
-    'sustain':      {'type': 'lin', 'min': 0.0, 'max': 1.0},
-    'release':      {'type': 'log', 'min': 0.01, 'max': 8.0},
-    'filter_cutoff':{'type': 'log', 'min': 20.0, 'max': 18000.0},
-    'filter_resonance': {'type': 'lin', 'min': 0.0, 'max': 0.95},
-    'filter_env_amount': {'type': 'lin', 'min': -8000.0, 'max': 8000.0},
-    'lfo_rate':     {'type': 'log', 'min': 0.01, 'max': 30.0},
-    'lfo_depth':    {'type': 'lin', 'min': 0.0, 'max': 1.0},
-    'lfo_target':   {'type': 'options', 'options': ['pitch', 'filter', 'amp', 'fm_depth']},
-    'lfo_shape':    {'type': 'options', 'options': ['sine', 'triangle', 'saw', 'square']},
-    'volume':       {'type': 'lin', 'min': 0.0, 'max': 1.0},
-    'analog_drive': {'type': 'lin', 'min': 1.0, 'max': 5.0},
-    'analog_drift': {'type': 'lin', 'min': 0.0, 'max': 0.005},
-    # FM
-    'fm_mod_freq_ratio': {'type': 'log', 'min': 0.1, 'max': 16.0},
-    'fm_mod_depth': {'type': 'log', 'min': 1.0, 'max': 5000.0},
-    # Chorus FX
-    'chorus_depth': {'type': 'lin', 'min': 0.0, 'max': 0.02},
-    'chorus_rate':  {'type': 'lin', 'min': 0.0, 'max': 5.0},
-    # --- Arpeggiator ---
-    'arp_on':       {'type': 'check'}, # Checkbutton
-    'arp_bpm':      {'type': 'lin', 'min': 30.0, 'max': 240.0},
-    'arp_rate':     {'type': 'options', 'options': [4, 8, 16, 32]}, # Representing 1/4, 1/8, 1/16, 1/32
-    'arp_pattern':  {'type': 'options', 'options': ['Up', 'Down', 'UpDown', 'Random']},
-    'arp_octaves':  {'type': 'options', 'options': [1, 2, 3, 4]}, # Could be lin slider 1-4 if preferred
+# --- Encoder Configuration (Using PHYSICAL BOARD Pin Numbers) ---
+# **CRITICAL: UPDATE THESE PINS TO YOUR ACTUAL WIRING USING PHYSICAL BOARD NUMBERS**
+ENCODER_PINS = {
+    # Encoder Name: (CLK_PIN, DT_PIN, SW_PIN or None, parameter_name, type, options/range, optional_toggle_target_for_SW)
+    'osc_type':      (7, 11, None, 'osc_type', 'options', ['saw', 'square', 'sine', 'triangle']), # No Switch
+    'chorus_amount': (13, 15, None, 'chorus_depth', 'continuous', (0.0, 0.02, 0.0005)), # No Switch, controls depth directly. Rate is fixed or another encoder
+    'volume':        (18, 22, 24, 'volume', 'continuous_toggle_func', (0.0, 1.0, 0.01), 'toggle_volume_mute'),
+    'arp_rate_enc':  (26, 29, 31, 'arp_rate', 'options_toggle_param', [4, 8, 16, 32], 'arp_on'),
+    'cutoff':        (32, 33, None, 'filter_cutoff', 'log_continuous', (20.0, 18000.0, 1.05)),
+    'resonance':     (35, 36, None, 'filter_resonance', 'continuous', (0.0, 0.95, 0.01)),
+    'env_amount':    (37, 38, None, 'filter_env_amount', 'continuous', (-8000.0, 8000.0, 100.0)),
+    'attack':        (8, 10, None, 'attack', 'log_continuous', (0.001, 5.0, 1.02)),
+    'decay':         (3, 5, None,  'decay', 'log_continuous', (0.01, 5.0, 1.02)),
+    'sustain':       (40, 23, None, 'sustain', 'continuous', (0.0, 1.0, 0.01)), # Example, ensure unique physical pins
+    'release':       (19, 21, None, 'release', 'log_continuous', (0.01, 8.0, 1.02)), # Example, ensure unique physical pins
 }
 
-# --- Helper Scaling Functions (remain the same) ---
-def log_scale(value, min_val, max_val, scale_min=0, scale_max=100):
-    if value <= scale_min: return min_val
-    min_val_log = max(min_val, 1e-9); log_min = np.log(min_val_log); log_max = np.log(max_val)
-    scale = (log_max - log_min) / (scale_max - scale_min)
-    if scale == 0: return min_val # Avoid issues if min=max
-    return np.exp(log_min + scale * (value - scale_min))
-def inverse_log_scale(param_value, min_val, max_val, scale_min=0, scale_max=100):
-    param_value = np.clip(param_value, min_val, max_val); min_val_log = max(min_val, 1e-9)
-    log_min = np.log(min_val_log); log_max = np.log(max_val)
-    scale = (log_max - log_min) / (scale_max - scale_min)
-    if scale == 0: return scale_min
-    param_value_log = max(param_value, 1e-9); val = scale_min + (np.log(param_value_log) - log_min) / scale
-    return np.clip(val, scale_min, scale_max)
-
-
-# --- Tkinter UI Class (Modified for Arp) ---
-class SynthUI:
-    def __init__(self, root, synth_instance):
-        self.root = root; self.synth = synth_instance; self.controls = {}
-        self.string_vars = {}; self.scale_vars = {}; self.check_vars = {} # Added check_vars
-        self._update_lock = False
-        self.root.title("Neptune 1"); self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
-        self.synth.set_ui_update_callback(self.schedule_ui_update)
-        style = ttk.Style(); style.theme_use('clam') # Or 'alt', 'default', 'classic'
-        # Styles (optional, adjust as needed)
-        style.configure('TFrame', background='#EEE')
-        style.configure('TLabel', background='#EEE')
-        style.configure('TLabelFrame', background='#EEE')
-        style.configure('TLabelFrame.Label', background='#EEE')
-        style.configure('TScale', background='#EEE')
-        style.configure('TCheckbutton', background='#EEE')
-
-        main_frame = ttk.Frame(root, padding="10")
-        main_frame.grid(row=0, column=0, sticky="nsew")
-        root.grid_rowconfigure(0, weight=1); root.grid_columnconfigure(0, weight=1)
-
-        # Frames (Add Arp Frame)
-        top_frame = ttk.Frame(main_frame)
-        osc_frame = ttk.LabelFrame(main_frame, text="Oscillator", padding="5")
-        fm_frame = ttk.LabelFrame(main_frame, text="FM", padding="5")
-        filter_frame = ttk.LabelFrame(main_frame, text="Filter", padding="5")
-        env_frame = ttk.LabelFrame(main_frame, text="Envelope", padding="5")
-        lfo_frame = ttk.LabelFrame(main_frame, text="LFO", padding="5")
-        master_frame = ttk.LabelFrame(main_frame, text="Master/FX", padding="5")
-        arp_frame = ttk.LabelFrame(main_frame, text="Arpeggiator", padding="5") # New Arp Frame
-
-        # Layout frames
-        top_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=5)
-        osc_frame.grid(row=1, column=0, padx=5, pady=5, sticky="ns")
-        fm_frame.grid(row=2, column=0, padx=5, pady=5, sticky="nsew")
-        filter_frame.grid(row=1, column=1, rowspan=2, padx=5, pady=5, sticky="ns")
-        env_frame.grid(row=1, column=2, rowspan=2, padx=5, pady=5, sticky="ns")
-        # Adjust LFO and Master/FX positions
-        lfo_frame.grid(row=3, column=0, padx=5, pady=5, sticky="nsew") # LFO below OSC/FM
-        master_frame.grid(row=3, column=1, padx=5, pady=5, sticky="nsew") # Master below Filter
-        arp_frame.grid(row=3, column=2, padx=5, pady=5, sticky="nsew") # Arp below Env
-
-        # Populate Top Frame (Preset)
-        ttk.Label(top_frame, text="Preset:").grid(row=0, column=0, padx=5, sticky="w")
-        preset_var = tk.StringVar(); self.string_vars['Preset'] = preset_var
-        preset_combo = ttk.Combobox(top_frame, textvariable=preset_var, values=self.synth.preset_names, state='readonly', width=25)
-        preset_combo.grid(row=0, column=1, padx=5, sticky="ew"); preset_combo.bind('<<ComboboxSelected>>', self._on_preset_change)
-        self.controls['Preset'] = preset_combo; top_frame.grid_columnconfigure(1, weight=1)
-
-        # Populate Sections
-        self._create_controls(osc_frame, ['osc_type', 'analog_drive', 'analog_drift'])
-        self._create_controls(fm_frame, ['fm_mod_freq_ratio', 'fm_mod_depth'])
-        self._create_controls(filter_frame, ['filter_cutoff', 'filter_resonance', 'filter_env_amount'])
-        self._create_controls(env_frame, ['attack', 'decay', 'sustain', 'release'])
-        self._create_controls(lfo_frame, ['lfo_rate', 'lfo_depth', 'lfo_target', 'lfo_shape'])
-        self._create_controls(master_frame, ['volume', 'chorus_depth', 'chorus_rate'])
-        # Populate Arp section
-        self._create_controls(arp_frame, ['arp_on', 'arp_bpm', 'arp_rate', 'arp_pattern', 'arp_octaves'])
-
-        self.update_controls_from_synth() # Initial update
-
-    # Modify _create_controls to handle 'check' type
-    def _create_controls(self, parent_frame, param_names):
-        for i, name in enumerate(param_names):
-            config = PARAM_CONFIG.get(name);
-            if not config: continue
-            label = ttk.Label(parent_frame, text=f"{name.replace('_', ' ').title()}:")
-            label.grid(row=i, column=0, padx=5, pady=2, sticky="w")
-            control_type = config['type']
-
-            if control_type == 'options':
-                var = tk.StringVar(); combo = ttk.Combobox(parent_frame, textvariable=var, values=config['options'], state='readonly', width=12)
-                combo.grid(row=i, column=1, padx=5, pady=2, sticky="ew"); combo.bind('<<ComboboxSelected>>', lambda e, p=name: self._on_value_change(p))
-                self.controls[name] = combo; self.string_vars[name] = var
-            elif control_type in ['lin', 'log']:
-                var = tk.DoubleVar(); scale = ttk.Scale(parent_frame, from_=0, to=100, orient='horizontal', variable=var, length=150, command=lambda val, p=name: self._on_value_change(p))
-                scale.grid(row=i, column=1, padx=5, pady=2, sticky="ew"); self.controls[name] = scale; self.scale_vars[name] = var
-            elif control_type == 'check': # Handle Checkbutton
-                var = tk.BooleanVar()
-                # Place checkbox directly, no separate label needed if text is descriptive
-                # Or use grid row=i, column=1 if keeping separate label
-                check = ttk.Checkbutton(parent_frame, variable=var, command=lambda p=name: self._on_value_change(p))
-                check.grid(row=i, column=1, padx=5, pady=2, sticky="w") # Align left
-                self.controls[name] = check
-                self.check_vars[name] = var # Store boolean var
-
-            parent_frame.grid_columnconfigure(1, weight=1) # Allow control to expand
-
-    # Modify _on_value_change to handle checkbuttons
-    def _on_value_change(self, param_name):
-        if self._update_lock or param_name not in self.controls: return
-        widget = self.controls[param_name]; config = PARAM_CONFIG.get(param_name); new_value = None
+# --- Rotary Encoder Class ---
+class RotaryEncoder:
+    def __init__(self, clk_pin, dt_pin, sw_pin, param_name, param_type, options_or_range, toggle_target=None, synth=None):
+        self.clk_pin = clk_pin; self.dt_pin = dt_pin; self.sw_pin = sw_pin
+        self.param_name = param_name; self.param_type = param_type
+        self.options_or_range = options_or_range; self.toggle_target = toggle_target
+        self.synth = synth; self.last_clk_state = GPIO.input(self.clk_pin); self.current_option_index = 0
+        if self.param_type in ['options', 'options_toggle_param']:
+            current_val = self.synth.params.get(self.param_name)
+            if current_val in self.options_or_range:
+                try: self.current_option_index = self.options_or_range.index(current_val)
+                except ValueError: self.current_option_index = 0
+        GPIO.add_event_detect(self.clk_pin, GPIO.FALLING, callback=self._clk_event, bouncetime=5)
+        if self.sw_pin is not None:
+            self.last_sw_state = GPIO.input(self.sw_pin)
+            GPIO.add_event_detect(self.sw_pin, GPIO.FALLING, callback=self._sw_event, bouncetime=300)
+        else: self.last_sw_state = None
+    def _clk_event(self, channel):
+        dt_state = GPIO.input(self.dt_pin); direction = 1 if dt_state == GPIO.HIGH else -1
+        self._update_param(direction)
+    def _sw_event(self, channel):
+        if self.sw_pin is None: return
+        time.sleep(0.05)
+        if GPIO.input(self.sw_pin) == GPIO.LOW:
+            print(f"Encoder '{self.param_name}' SW Press (Pin {self.sw_pin})")
+            if self.param_type == 'toggle_param' or self.param_type == 'options_toggle_param':
+                if self.toggle_target:
+                    current_state = self.synth.params.get(self.toggle_target, False)
+                    self.synth.set_params({self.toggle_target: not current_state})
+                    print(f"Toggled {self.toggle_target}: {not current_state}")
+            elif self.param_type == 'continuous_toggle_func':
+                if self.toggle_target and hasattr(self.synth, self.toggle_target):
+                    try: getattr(self.synth, self.toggle_target)()
+                    except Exception as e: print(f"Error toggle func {self.toggle_target}: {e}", file=sys.stderr)
+            # NO special handling for chorus switch here anymore, as it has no switch defined in ENCODER_PINS
+    def _update_param(self, direction):
         try:
-            if isinstance(widget, ttk.Combobox):
-                val_str = self.string_vars[param_name].get()
-                # Try converting options like rate/octaves back to numbers
-                try: new_value = int(val_str)
-                except ValueError:
-                     try: new_value = float(val_str)
-                     except ValueError: new_value = val_str # Keep as string if not number
-            elif isinstance(widget, ttk.Scale):
-                scaled_val = self.scale_vars[param_name].get()
-                if config['type'] == 'log': new_value = log_scale(scaled_val, config['min'], config['max'])
-                else: new_value = config['min'] + (config['max'] - config['min']) * (scaled_val / 100.0)
-            elif isinstance(widget, ttk.Checkbutton): # Handle Checkbutton
-                 new_value = self.check_vars[param_name].get() # Get boolean value
+            current_val = self.synth.params.get(self.param_name); new_val = current_val
+            if self.param_type == 'continuous' or self.param_type == 'log_continuous':
+                min_val, max_val, step = self.options_or_range
+                if self.param_type == 'log_continuous': safe_current_val = max(current_val, 1e-9); factor = step if direction > 0 else 1.0 / step; new_val = safe_current_val * factor
+                else: new_val = current_val + (direction * step)
+                new_val = np.clip(new_val, min_val, max_val)
+            elif self.param_type in ['options', 'options_toggle_param']:
+                self.current_option_index = (self.current_option_index + direction) % len(self.options_or_range)
+                new_val = self.options_or_range[self.current_option_index]
+            if abs(new_val - current_val) > 1e-9:
+                self.synth.set_params({self.param_name: new_val})
+                display_val = f"{new_val:.3f}" if isinstance(new_val, float) else new_val
+                print(f"Encoder '{self.param_name}' (CLK:{self.clk_pin}) -> {self.param_name}: {display_val}")
+        except Exception as e: print(f"Error update param {self.param_name}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+    def cleanup(self):
+        try: GPIO.remove_event_detect(self.clk_pin)
+        if self.sw_pin is not None: GPIO.remove_event_detect(self.sw_pin)
+        except Exception: pass
 
-            if new_value is not None: self.synth.set_params({param_name: new_value}, source="ui")
-        except Exception as e: print(f"ERR UI change {param_name}: {e}", file=sys.stderr)
-
-    # Modify update_controls_from_synth for checkbuttons
-    def update_controls_from_synth(self):
-        if self._update_lock: return
-        self._update_lock = True
-        try:
-            current_params = self.synth.params; preset_name = self.synth.current_preset_name
-            if self.string_vars['Preset'].get() != preset_name: self.string_vars['Preset'].set(preset_name)
-
-            for name, widget in self.controls.items():
-                if name == 'Preset' or name not in current_params: continue
-                config = PARAM_CONFIG.get(name); current_val = current_params[name]
-                try:
-                    if isinstance(widget, ttk.Combobox):
-                        # For options that are numbers (rate, octaves), ensure string conversion
-                        if self.string_vars[name].get() != str(current_val):
-                            self.string_vars[name].set(str(current_val))
-                    elif isinstance(widget, ttk.Scale):
-                        scaled_val = 0.0
-                        if config['type'] == 'log': scaled_val = inverse_log_scale(current_val, config['min'], config['max'])
-                        else: range_ = config['max'] - config['min']; scaled_val = ((current_val - config['min']) / range_) * 100.0 if range_ != 0 else 0.0
-                        if abs(self.scale_vars[name].get() - scaled_val) > 0.1: self.scale_vars[name].set(scaled_val)
-                    elif isinstance(widget, ttk.Checkbutton): # Handle checkbutton update
-                        if self.check_vars[name].get() != bool(current_val):
-                            self.check_vars[name].set(bool(current_val))
-
-                except Exception as e: print(f"ERR UI update {name}: {e}", file=sys.stderr)
-        finally: self._update_lock = False
-
-    # Unchanged methods: _on_preset_change, schedule_ui_update, _on_closing
-    def _on_preset_change(self, event=None):
-        if self._update_lock: return
-        selected_preset = self.string_vars['Preset'].get()
-        self.synth.load_preset(selected_preset)
-    def schedule_ui_update(self): self.root.after(10, self.update_controls_from_synth)
-    def _on_closing(self):
-        print("UI closing...")
-        global midi_thread_running, midi_port, arp_thread_running # Make sure arp flag is global if used here
-        midi_thread_running = False # Signal MIDI thread
-        if self.synth: self.synth._stop_arp_thread() # Stop arp thread via synth method
-        if midi_port and not midi_port.closed:
-            print("Closing MIDI port...")
-            try: midi_port.close()
-            except Exception as e: print(f"Error closing MIDI port: {e}", file=sys.stderr)
-        if self.synth: self.synth.close() # Close audio stream
-        self.root.destroy()
-        print("Cleanup complete.")
-
-
-# --- MIDI Input Thread (remain the same) ---
-# --- MIDI Input Thread (Corrected Syntax Errors) ---
-midi_thread_running = True
-midi_port = None
-
+# --- MIDI Input Thread ---
+midi_thread_running = True; midi_port = None
 def midi_listener(synth_instance, port_name):
-    """Listens for MIDI messages and calls synth methods (uses blocking iterator)."""
     global midi_thread_running, midi_port
-    print(f"MIDI thread started for port '{port_name}'.")
-
+    print(f"MIDI thread for '{port_name}'.")
     while midi_thread_running:
         try:
             if midi_port is None or midi_port.closed:
-                 if not midi_thread_running: break # Exit if flag already false
-                 print(f"Attempting to open MIDI port '{port_name}'...")
-                 midi_port = mido.open_input(port_name) # Assign to global var
-                 print(f"Listening on '{port_name}'...")
-
-            # This loop blocks until a message arrives or the port is closed/errors
+                 if not midi_thread_running: break
+                 print(f"Opening MIDI '{port_name}'..."); midi_port = mido.open_input(port_name); print(f"Listening '{port_name}'...")
             for msg in midi_port:
-                if not midi_thread_running: break # Check flag before processing
-
-                # Process the message
-                if msg.type == 'note_on' and msg.velocity > 0:
-                    synth_instance.note_on(msg.note, msg.velocity)
-                elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                    synth_instance.note_off(msg.note)
-                elif msg.type == 'control_change':
-                    synth_instance.control_change(msg.control, msg.value)
-                elif msg.type == 'program_change':
-                    synth_instance.load_preset(msg.program)
-                # Add other message types if needed
-
-            # If the inner loop finished, check the flag again before deciding to reopen
-            if not midi_thread_running:
-                print("MIDI thread: Stop flag detected.")
-                break # Exit the outer while loop
-
+                if not midi_thread_running: break
+                try:
+                    if msg.type == 'note_on' and msg.velocity > 0: synth_instance.note_on(msg.note, msg.velocity)
+                    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0): synth_instance.note_off(msg.note)
+                except Exception as e: print(f"Error MIDI msg {msg}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+            if not midi_thread_running: break
         except (OSError, IOError, mido.MidiError) as e:
-            print(f"MIDI Port Error on '{port_name}': {e}. Retrying...", file=sys.stderr)
-            if midi_port and not midi_port.closed:
-                try: midi_port.close()
-                except Exception: pass # Ignore errors during close in except block
-            midi_port = None # Mark as closed
-            # Wait before retrying, checking the flag periodically
-            # --- FIX 1: Corrected loop syntax ---
-            for _ in range(20): # Check every 100ms for 2 seconds
-                 time.sleep(0.1)
-                 if not midi_thread_running:
-                     break # Exit wait loop if stopped
-            if not midi_thread_running:
-                break # Exit outer loop if stopped during wait
-
-        except Exception as e: # Catch any other unexpected errors
-            print(f"\nUnexpected error in MIDI listener thread: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            if midi_port and not midi_port.closed:
-                try: midi_port.close()
-                except Exception: pass
-            midi_port = None
-            # Wait longer after an unknown error
-            # --- FIX 2: Corrected loop syntax ---
-            for _ in range(50): # Check every 100ms for 5 seconds
-                 time.sleep(0.1)
-                 if not midi_thread_running:
-                     break # Exit wait loop if stopped
-            if not midi_thread_running:
-                break # Exit outer loop if stopped during wait
-
-        # If we reach here, the port might have closed normally or errored.
-        # The loop will continue if midi_thread_running is True, attempting to reopen.
-        if midi_port and midi_port.closed:
-            print(f"MIDI port '{port_name}' appears closed.")
-            midi_port = None
-
-    # Final cleanup when thread exits
-    if midi_port and not midi_port.closed:
-        print("Closing MIDI port from thread exit...")
-        try: midi_port.close()
-        except Exception: pass
+            print(f"MIDI Port Error: {e}. Retrying...", file=sys.stderr)
+            if midi_port and not midi_port.closed: try: midi_port.close()
+            except Exception: pass; midi_port = None
+            for _ in range(20): time.sleep(0.1);  if not midi_thread_running: break
+            if not midi_thread_running: break
+        except Exception as e:
+            print(f"Unexpected MIDI listener error: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+            if midi_port and not midi_port.closed: try: midi_port.close()
+            except Exception: pass; midi_port = None
+            for _ in range(50): time.sleep(0.1); if not midi_thread_running: break
+            if not midi_thread_running: break
+        if midi_port and midi_port.closed: print(f"MIDI port '{port_name}' closed."); midi_port = None
+    if midi_port and not midi_port.closed: print("Closing MIDI from thread exit..."); try: midi_port.close()
+    except Exception: pass
     print("MIDI thread finished.")
 
-
-# --- Main Execution (remain mostly the same, ensure presets are loaded) ---
+# --- Main Execution ---
 if __name__ == "__main__":
-    SAMPLE_RATE = 44100
-    BLOCK_SIZE = 1024 # Keep increased block size
-    MAX_VOICES = 16   # Max voices for synth engine (arp uses these)
+    SAMPLE_RATE = 44100; BLOCK_SIZE = 1024; MAX_VOICES = 6
+    SYNTH_INSTANCE = None; ENCODERS_INITIALIZED = []; MIDI_THREAD_INSTANCE = None
+    GPIO_MODE_SET = False
+    if RPI_GPIO_AVAILABLE:
+        try: GPIO.setmode(GPIO.BOARD); GPIO.setwarnings(False); GPIO_MODE_SET = True; print("GPIO mode set to BOARD.")
+        except RuntimeError as e: print(f"ERR RPi.GPIO setup: {e}. Encoders disabled.", file=sys.stderr)
+        except Exception as e: print(f"Unexpected ERR RPi.GPIO setup: {e}. Encoders disabled.", file=sys.stderr)
+    else: print("RPi.GPIO not available. Encoders disabled.", file=sys.stderr)
 
-    # --- Select MIDI Port ---
-    root_check = tk.Tk(); root_check.withdraw()
     selected_port_name = None
-    while selected_port_name is None:
-        try:
-            print("Scanning MIDI ports..."); available_ports = mido.get_input_names()
-            if not available_ports: messagebox.showerror("MIDI Error", "No MIDI input devices found."); exit()
-            port_list_str = "\n".join([f"{i}: {name}" for i, name in enumerate(available_ports)])
-            result = available_ports[0]
-        except Exception as e: messagebox.showerror("MIDI Error", f"Scan error: {e}"); exit()
-    root_check.destroy()
-
-    # --- Initialize Synth ---
-    synth = None
     try:
-        print("Initializing synth..."); synth = Neptune1(sample_rate=SAMPLE_RATE, block_size=BLOCK_SIZE, max_voices=MAX_VOICES)
-        if synth.stream: print(f"Actual audio settings: SR={synth.stream.samplerate:.0f}, Block={synth.stream.blocksize}, Latency={synth.stream.latency*1000:.1f}ms")
-        else: print("Warning: Synth stream init failed.", file=sys.stderr)
-    except Exception as e: messagebox.showerror("Synth Error", f"Synth init failed: {e}"); exit(1)
+        print("Scanning MIDI..."); available_ports = mido.get_input_names()
+        if not available_ports: print("No MIDI inputs found.", file=sys.stderr)
+        elif len(available_ports) == 1: selected_port_name = available_ports[0]; print(f"Auto MIDI: '{selected_port_name}'")
+        else:
+            print("Multi MIDI:"); [print(f"  {i}: {n}") for i,n in enumerate(available_ports)]
+            for name in available_ports:
+                if "midi" in name.lower() and "through" not in name.lower() and "virtual" not in name.lower(): selected_port_name = name; break
+            if not selected_port_name: selected_port_name = available_ports[0]
+            print(f"Auto MIDI: '{selected_port_name}' (from multiple)")
+    except Exception as e: print(f"Error MIDI auto-detect: {e}", file=sys.stderr)
 
-    # --- Initialize UI ---
-    root = tk.Tk(); app = SynthUI(root, synth)
+    try:
+        print("Init synth..."); SYNTH_INSTANCE = PySynthJunoMIDI(sample_rate=SAMPLE_RATE, block_size=BLOCK_SIZE, max_voices=MAX_VOICES)
+        if SYNTH_INSTANCE.stream: print(f"Audio: {SYNTH_INSTANCE.stream.device}, SR={SYNTH_INSTANCE.stream.samplerate:.0f}, Block={SYNTH_INSTANCE.stream.blocksize}, Latency={SYNTH_INSTANCE.stream.latency*1000:.1f}ms")
+        else: print("CRITICAL: Synth stream failed.", file=sys.stderr);
+        if GPIO_MODE_SET: GPIO.cleanup();
+        sys.exit(1)
+    except Exception as e: print(f"FATAL: Synth init: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr);
+    if GPIO_MODE_SET: GPIO.cleanup();
+    sys.exit(1)
 
-    # --- Load Initial Preset (ensure it exists) ---
-    initial_preset_name = "Default" # Or choose another from your list
-    if initial_preset_name not in PRESETS: initial_preset_name = list(PRESETS.keys())[0] # Fallback
-    synth.load_preset(initial_preset_name)
+    # Define toggle_volume_mute attached to the synth instance
+    SYNTH_INSTANCE.is_volume_muted = False
+    SYNTH_INSTANCE._stored_volume = SYNTH_INSTANCE.params['volume']
+    def _synth_toggle_volume_mute_method(self_synth): # self_synth is SYNTH_INSTANCE
+        with self_synth.lock:
+            if not self_synth.is_volume_muted:
+                self_synth._stored_volume = self_synth.params['volume']
+                self_synth.params['volume'] = 0.0
+                self_synth.is_volume_muted = True; print("Volume Muted")
+            else:
+                self_synth.params['volume'] = self_synth._stored_volume
+                self_synth.is_volume_muted = False; print(f"Volume Unmuted: {self_synth.params['volume']:.2f}")
+            params_copy = self_synth.params.copy();
+            for v_voice in self_synth.voices: v_voice.params = params_copy.copy()
+            self_synth.current_preset_name = self_synth._find_preset_name(self_synth.params) # Recalc preset name
+    SYNTH_INSTANCE.toggle_volume_mute = lambda: _synth_toggle_volume_mute_method(SYNTH_INSTANCE)
 
-    # --- Start MIDI Listener Thread ---
-    midi_thread_running = True
-    midi_thread = threading.Thread(target=midi_listener, args=(synth, selected_port_name), daemon=True)
-    midi_thread.start()
 
-    # --- Start Tkinter Main Loop ---
-    print("Starting UI...")
-    try: root.mainloop()
-    except KeyboardInterrupt: print("Ctrl+C..."); app._on_closing()
+    print("\n--- Init Encoders (Check PHYSICAL BOARD pins!) ---")
+    if RPI_GPIO_AVAILABLE and GPIO_MODE_SET:
+        for name, config_tuple in ENCODER_PINS.items():
+            if len(config_tuple) < 6: print(f"  Skipping misconfigured encoder '{name}'.", file=sys.stderr); continue
+            clk, dt, sw, param, p_type, opts_range = config_tuple[:6]
+            toggle = config_tuple[6] if len(config_tuple) > 6 else None
+            try:
+                GPIO.setup(clk, GPIO.IN, pull_up_down=GPIO.PUD_UP); GPIO.setup(dt, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                if sw is not None: GPIO.setup(sw, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                ENCODERS_INITIALIZED.append(RotaryEncoder(clk, dt, sw, param, p_type, opts_range, toggle, SYNTH_INSTANCE))
+                sw_pin_str = f"SW:{sw}" if sw is not None else "SW:None"
+                print(f"  Encoder '{name}' ({param}) on CLK:{clk}, DT:{dt}, {sw_pin_str}")
+            except Exception as e: print(f"  ERR Init encoder '{name}': {e}. Check pins.", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+    else: print("  RPi.GPIO not active or mode not set. Encoders disabled.", file=sys.stderr)
 
-    print("Application finished.")
+    if selected_port_name:
+        midi_thread_running = True
+        MIDI_THREAD_INSTANCE = threading.Thread(target=midi_listener, args=(SYNTH_INSTANCE, selected_port_name), daemon=True)
+        try: MIDI_THREAD_INSTANCE.start()
+        except Exception as e: print(f"FATAL starting MIDI thread: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr);
+        if SYNTH_INSTANCE: SYNTH_INSTANCE.close();
+        if GPIO_MODE_SET: GPIO.cleanup();
+        sys.exit(1)
+    else: print("No MIDI port. MIDI input ignored.")
+
+    initial_preset = "Default";
+    if initial_preset not in PRESETS: initial_preset = list(PRESETS.keys())[0] if PRESETS else None
+    if initial_preset and SYNTH_INSTANCE: # Ensure synth instance exists
+        try: SYNTH_INSTANCE.load_preset(initial_preset)
+        except Exception as e: print(f"ERR loading initial preset '{initial_preset}': {e}", file=sys.stderr)
+    elif not PRESETS: print("No presets defined. Using default parameters.", file=sys.stderr)
+
+
+    print("\nNeptune 1 Synthesizer running. Ctrl+C to exit."); print("Control with rotary encoders.")
+    try:
+        while True: time.sleep(1)
+    except KeyboardInterrupt: print("\nCtrl+C. Shutting down...")
+    finally:
+        print("Cleaning up..."); midi_thread_running = False # Signal threads
+        if MIDI_THREAD_INSTANCE and MIDI_THREAD_INSTANCE.is_alive():
+            print("Stopping MIDI thread...");
+            if midi_port and not midi_port.closed: try: midi_port.close() # Help interrupt
+            except Exception: pass
+            MIDI_THREAD_INSTANCE.join(timeout=0.5) # Short timeout
+            if MIDI_THREAD_INSTANCE.is_alive(): print("Warn: MIDI thread join timed out.", file=sys.stderr)
+        if SYNTH_INSTANCE: SYNTH_INSTANCE.close() # Stops arp and audio
+        if RPI_GPIO_AVAILABLE and GPIO_MODE_SET:
+            for encoder in ENCODERS_INITIALIZED:
+                try: encoder.cleanup()
+                except Exception as e: print(f"Err cleaning encoder: {e}", file=sys.stderr)
+            GPIO.cleanup(); print("GPIO cleaned up.")
+        print("Synthesizer stopped.")
