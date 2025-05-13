@@ -25,7 +25,7 @@ DEFAULT_PARAMS = {
     'osc_type': 'saw', 'attack': 0.01, 'decay': 0.2, 'sustain': 0.8, 'release': 0.3,
     'filter_cutoff': 5000, 'filter_resonance': 0.1, 'filter_env_amount': 0,
     'volume': 0.6, 'analog_drive': 1.0, 'analog_drift': 0.0000,
-    'chorus_depth': 0.005, 'chorus_rate': 0.5, # chorus_depth will be main control for "Chorus Amount"
+    'chorus_depth': 0.005, 'chorus_rate': 0.5,
     'arp_on': False, 'arp_bpm': 120.0, 'arp_rate': 16,
     'arp_pattern': 'Up', 'arp_octaves': 1,
 }
@@ -142,7 +142,7 @@ class PySynthJunoMIDI:
         self.current_preset_index = 0; self.current_preset_name = self._find_preset_name(self.params)
         self.chorus_lfo_phase = 0.0; max_chorus_delay_sec = 0.05
         self.chorus_delay_line = np.zeros(int(sample_rate * max_chorus_delay_sec * 1.2), dtype=np.float32)
-        self.chorus_delay_ptr = 0; self._chorus_on_depth = self.params.get('chorus_depth', 0.005) # Used for toggle
+        self.chorus_delay_ptr = 0; self._chorus_on_depth = self.params.get('chorus_depth', 0.005)
         self.stream = None; self.held_notes = []; self.held_note_velocities = {}
         self._arp_thread = None; self._arp_thread_running = False; self._arp_step = 0
         self._arp_last_played_note = None; self._arp_direction_updown = 1
@@ -183,7 +183,7 @@ class PySynthJunoMIDI:
                         elif default_type == int and not isinstance(new_value, int): new_value = int(float(value))
                         elif default_type == str and not isinstance(new_value, str): new_value = str(value)
                         if new_value != current_value:
-                            if key == 'chorus_depth' and new_value > 0: self._chorus_on_depth = new_value # Store if being set by slider
+                            if key == 'chorus_depth' and new_value > 0: self._chorus_on_depth = new_value
                             self.params[key] = new_value; changed = True
                             if key == 'arp_on': arp_state_changed = True
                     except (ValueError, TypeError) as e: print(f"Warn: Param conversion {key}={value}: {e}", file=sys.stderr)
@@ -199,34 +199,21 @@ class PySynthJunoMIDI:
             if new_arp_on and not old_arp_on: self._start_arp_thread()
             elif not new_arp_on and old_arp_on: self._stop_arp_thread()
 
-    def toggle_volume_mute(self): # Function to be called by encoder switch
+    def toggle_volume_mute(self):
         with self.lock:
             if not hasattr(self, 'is_volume_muted'): self.is_volume_muted = False
             if not hasattr(self, '_stored_volume'): self._stored_volume = self.params['volume']
-
             if not self.is_volume_muted:
-                self._stored_volume = self.params['volume']
-                self.params['volume'] = 0.0
-                self.is_volume_muted = True
-                print("Volume Muted")
+                self._stored_volume = self.params['volume']; self.params['volume'] = 0.0; self.is_volume_muted = True; print("Volume Muted")
             else:
-                self.params['volume'] = self._stored_volume
-                self.is_volume_muted = False
-                print(f"Volume Unmuted: {self.params['volume']:.2f}")
-            # Update voices
-            current_params_copy = self.params.copy()
-            for voice in self.voices: voice.params = current_params_copy.copy()
-            self.current_preset_name = self._find_preset_name(self.params) # Becomes "Custom"
+                self.params['volume'] = self._stored_volume; self.is_volume_muted = False; print(f"Volume Unmuted: {self.params['volume']:.2f}")
+            params_copy = self.params.copy(); [v.params = params_copy.copy() for v in self.voices]
+            self.current_preset_name = self._find_preset_name(self.params)
 
-
-    def toggle_chorus(self): # Called by "Chorus Amount" encoder switch
+    def toggle_chorus(self): # Called by encoder if switch is defined for chorus_amount
         with self.lock: changed = False; current_depth = self.params.get('chorus_depth', 0.0)
-        if current_depth > 0:
-            # self._chorus_on_depth = current_depth # No need to store again, slider sets this
-            self.params['chorus_depth'] = 0.0; print("Chorus OFF by Switch"); changed = True
-        else:
-            restore_depth = self._chorus_on_depth if self._chorus_on_depth > 0 else 0.005
-            self.params['chorus_depth'] = restore_depth; print(f"Chorus ON by Switch (Depth: {restore_depth:.3f})"); changed = True
+        if current_depth > 0: self.params['chorus_depth'] = 0.0; print("Chorus OFF by Switch"); changed = True
+        else: restore_depth = self._chorus_on_depth if self._chorus_on_depth > 0 else 0.005; self.params['chorus_depth'] = restore_depth; print(f"Chorus ON by Switch (Depth: {restore_depth:.3f})"); changed = True
         if changed:
              try:
                  with self.lock: current_params_copy = self.params.copy()
@@ -247,10 +234,10 @@ class PySynthJunoMIDI:
         except Exception as e: print(f"Error finding preset {preset_name_or_index}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr); return False
         if preset_to_load:
             print(f"\nLoading preset {target_index if target_index !=-1 else ''}: {preset_name}")
-            new_params = DEFAULT_PARAMS.copy()
+            new_params = DEFAULT_PARAMS.copy();
             for k, v in preset_to_load.items():
-                if k in new_params: new_params[k] = v # Only update known keys
-            self._chorus_on_depth = new_params.get('chorus_depth', 0.005) # Store loaded depth
+                if k in new_params: new_params[k] = v
+            self._chorus_on_depth = new_params.get('chorus_depth', 0.005)
             self.set_params(new_params, source="load_preset")
             self.current_preset_index = target_index; self.current_preset_name = preset_name; return True
         return False
@@ -258,7 +245,7 @@ class PySynthJunoMIDI:
     def _apply_master_chorus(self, signal):
         try:
             p = self.params; sr = self.sample_rate; chorus_depth = p.get('chorus_depth', 0.0); chorus_rate = p.get('chorus_rate', 0.0)
-            if chorus_depth <= 0 or chorus_rate <= 0: return signal # Chorus is off if depth is 0
+            if chorus_depth <= 0 or chorus_rate <= 0: return signal
             lfo_freq_rad = 2 * np.pi * chorus_rate / sr; num_samples = len(signal); dl_len = len(self.chorus_delay_line)
             if dl_len == 0: return signal
             t = np.arange(self.chorus_lfo_phase, self.chorus_lfo_phase + num_samples * lfo_freq_rad, lfo_freq_rad, dtype=np.float32)[:num_samples]
@@ -322,9 +309,7 @@ class PySynthJunoMIDI:
             for voice in self.voices:
                 if voice.note == note and voice.envelope_stage not in ['release', 'off']: voice.note_off(); break
         except Exception as e: print(f"Error finding/stopping voice for note {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
-
-    def control_change(self, control, value): pass # No MIDI CCs handled directly if encoders are primary
-
+    def control_change(self, control, value): pass
     def close(self):
         print("Stopping synth...");
         try: self._stop_arp_thread()
@@ -404,21 +389,19 @@ class PySynthJunoMIDI:
             if self._arp_last_played_note == note: self._arp_last_played_note = None
         except Exception as e: print(f"Error in _arp_stop_note for note {note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
 
-# --- Encoder Configuration (Using PHYSICAL BOARD Pin Numbers) ---
-# **CRITICAL: UPDATE THESE PINS TO YOUR ACTUAL WIRING USING PHYSICAL BOARD NUMBERS**
+# --- Encoder Configuration (Using PHYSICAL BOARD Pin Numbers from Diagram) ---
 ENCODER_PINS = {
-    # Encoder Name: (CLK_PIN, DT_PIN, SW_PIN or None, parameter_name, type, options/range, optional_toggle_target_for_SW)
-    'osc_type':      (7, 11, None, 'osc_type', 'options', ['saw', 'square', 'sine', 'triangle']), # No Switch
-    'chorus_amount': (13, 15, None, 'chorus_depth', 'continuous', (0.0, 0.02, 0.0005)), # No Switch, controls depth directly. Rate is fixed or another encoder
-    'volume':        (18, 22, 24, 'volume', 'continuous_toggle_func', (0.0, 1.0, 0.01), 'toggle_volume_mute'),
-    'arp_rate_enc':  (26, 29, 31, 'arp_rate', 'options_toggle_param', [4, 8, 16, 32], 'arp_on'),
-    'cutoff':        (32, 33, None, 'filter_cutoff', 'log_continuous', (20.0, 18000.0, 1.05)),
-    'resonance':     (35, 36, None, 'filter_resonance', 'continuous', (0.0, 0.95, 0.01)),
-    'env_amount':    (37, 38, None, 'filter_env_amount', 'continuous', (-8000.0, 8000.0, 100.0)),
-    'attack':        (8, 10, None, 'attack', 'log_continuous', (0.001, 5.0, 1.02)),
-    'decay':         (3, 5, None,  'decay', 'log_continuous', (0.01, 5.0, 1.02)),
-    'sustain':       (40, 23, None, 'sustain', 'continuous', (0.0, 1.0, 0.01)), # Example, ensure unique physical pins
-    'release':       (19, 21, None, 'release', 'log_continuous', (0.01, 8.0, 1.02)), # Example, ensure unique physical pins
+    'osc_type':      (29, 31, None, 'osc_type', 'options', ['saw', 'square', 'sine', 'triangle']), # GPIO5, GPIO6
+    'chorus_amount': (33, 35, None, 'chorus_depth', 'continuous', (0.0, 0.02, 0.0005)),           # GPIO13, GPIO19 (Controls depth, Rate fixed or another encoder)
+    'volume':        (37, 36, 38, 'volume', 'continuous_toggle_func', (0.0, 1.0, 0.01), 'toggle_volume_mute'), # GPIO26, GPIO16, GPIO20
+    'arp_rate_enc':  (22, 18, 16, 'arp_rate', 'options_toggle_param', [4, 8, 16, 32], 'arp_on'), # GPIO25, GPIO24, GPIO23
+    'cutoff':        (15, 13, None, 'filter_cutoff', 'log_continuous', (20.0, 18000.0, 1.05)),     # GPIO22, GPIO27
+    'resonance':     (11, 7, None, 'filter_resonance', 'continuous', (0.0, 0.95, 0.01)),         # GPIO17, GPIO4
+    'env_amount':    (5, 3, None, 'filter_env_amount', 'continuous', (-8000.0, 8000.0, 100.0)),   # GPIO3, GPIO2
+    'attack':        (40, 21, None, 'attack', 'log_continuous', (0.001, 5.0, 1.02)),             # GPIO21, GPIO9
+    'decay':         (19, 23, None,  'decay', 'log_continuous', (0.01, 5.0, 1.02)),             # GPIO10, GPIO11
+    'sustain':       (8, 10, None, 'sustain', 'continuous', (0.0, 1.0, 0.01)),                 # GPIO14(TXD), GPIO15(RXD) - If Serial disabled
+    'release':       (12, 24, None, 'release', 'log_continuous', (0.01, 8.0, 1.02)),               # GPIO18(PCM_CLK), GPIO8(SPI_CE0) - If PCM/SPI0 disabled
 }
 
 # --- Rotary Encoder Class ---
@@ -455,7 +438,6 @@ class RotaryEncoder:
                 if self.toggle_target and hasattr(self.synth, self.toggle_target):
                     try: getattr(self.synth, self.toggle_target)()
                     except Exception as e: print(f"Error toggle func {self.toggle_target}: {e}", file=sys.stderr)
-            # NO special handling for chorus switch here anymore, as it has no switch defined in ENCODER_PINS
     def _update_param(self, direction):
         try:
             current_val = self.synth.params.get(self.param_name); new_val = current_val
@@ -548,18 +530,12 @@ if __name__ == "__main__":
     # Define toggle_volume_mute attached to the synth instance
     SYNTH_INSTANCE.is_volume_muted = False
     SYNTH_INSTANCE._stored_volume = SYNTH_INSTANCE.params['volume']
-    def _synth_toggle_volume_mute_method(self_synth): # self_synth is SYNTH_INSTANCE
+    def _synth_toggle_volume_mute_method(self_synth):
         with self_synth.lock:
-            if not self_synth.is_volume_muted:
-                self_synth._stored_volume = self_synth.params['volume']
-                self_synth.params['volume'] = 0.0
-                self_synth.is_volume_muted = True; print("Volume Muted")
-            else:
-                self_synth.params['volume'] = self_synth._stored_volume
-                self_synth.is_volume_muted = False; print(f"Volume Unmuted: {self_synth.params['volume']:.2f}")
-            params_copy = self_synth.params.copy();
-            for v_voice in self_synth.voices: v_voice.params = params_copy.copy()
-            self_synth.current_preset_name = self_synth._find_preset_name(self_synth.params) # Recalc preset name
+            if not self_synth.is_volume_muted: self_synth._stored_volume = self_synth.params['volume']; self_synth.params['volume'] = 0.0; self_synth.is_volume_muted = True; print("Volume Muted")
+            else: self_synth.params['volume'] = self_synth._stored_volume; self_synth.is_volume_muted = False; print(f"Volume Unmuted: {self_synth.params['volume']:.2f}")
+            params_copy = self_synth.params.copy(); [v.params = params_copy.copy() for v in self_synth.voices]
+            self_synth.current_preset_name = self_synth._find_preset_name(self_synth.params)
     SYNTH_INSTANCE.toggle_volume_mute = lambda: _synth_toggle_volume_mute_method(SYNTH_INSTANCE)
 
 
@@ -590,7 +566,7 @@ if __name__ == "__main__":
 
     initial_preset = "Default";
     if initial_preset not in PRESETS: initial_preset = list(PRESETS.keys())[0] if PRESETS else None
-    if initial_preset and SYNTH_INSTANCE: # Ensure synth instance exists
+    if initial_preset and SYNTH_INSTANCE:
         try: SYNTH_INSTANCE.load_preset(initial_preset)
         except Exception as e: print(f"ERR loading initial preset '{initial_preset}': {e}", file=sys.stderr)
     elif not PRESETS: print("No presets defined. Using default parameters.", file=sys.stderr)
@@ -601,14 +577,14 @@ if __name__ == "__main__":
         while True: time.sleep(1)
     except KeyboardInterrupt: print("\nCtrl+C. Shutting down...")
     finally:
-        print("Cleaning up..."); midi_thread_running = False # Signal threads
+        print("Cleaning up..."); midi_thread_running = False
         if MIDI_THREAD_INSTANCE and MIDI_THREAD_INSTANCE.is_alive():
             print("Stopping MIDI thread...");
-            if midi_port and not midi_port.closed: try: midi_port.close() # Help interrupt
+            if midi_port and not midi_port.closed: try: midi_port.close()
             except Exception: pass
-            MIDI_THREAD_INSTANCE.join(timeout=0.5) # Short timeout
+            MIDI_THREAD_INSTANCE.join(timeout=0.5)
             if MIDI_THREAD_INSTANCE.is_alive(): print("Warn: MIDI thread join timed out.", file=sys.stderr)
-        if SYNTH_INSTANCE: SYNTH_INSTANCE.close() # Stops arp and audio
+        if SYNTH_INSTANCE: SYNTH_INSTANCE.close()
         if RPI_GPIO_AVAILABLE and GPIO_MODE_SET:
             for encoder in ENCODERS_INITIALIZED:
                 try: encoder.cleanup()
