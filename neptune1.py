@@ -391,17 +391,17 @@ class PySynthJunoMIDI:
 
 # --- Encoder Configuration (Using PHYSICAL BOARD Pin Numbers from Diagram) ---
 ENCODER_PINS = {
-    'osc_type':      (29, 31, None, 'osc_type', 'options', ['saw', 'square', 'sine', 'triangle']), # GPIO5, GPIO6
-    'chorus_amount': (33, 35, None, 'chorus_depth', 'continuous', (0.0, 0.02, 0.0005)),           # GPIO13, GPIO19 (Controls depth, Rate fixed or another encoder)
-    'volume':        (37, 36, 38, 'volume', 'continuous_toggle_func', (0.0, 1.0, 0.01), 'toggle_volume_mute'), # GPIO26, GPIO16, GPIO20
-    'arp_rate_enc':  (22, 18, 16, 'arp_rate', 'options_toggle_param', [4, 8, 16, 32], 'arp_on'), # GPIO25, GPIO24, GPIO23
-    'cutoff':        (15, 13, None, 'filter_cutoff', 'log_continuous', (20.0, 18000.0, 1.05)),     # GPIO22, GPIO27
-    'resonance':     (11, 7, None, 'filter_resonance', 'continuous', (0.0, 0.95, 0.01)),         # GPIO17, GPIO4
-    'env_amount':    (5, 3, None, 'filter_env_amount', 'continuous', (-8000.0, 8000.0, 100.0)),   # GPIO3, GPIO2
-    'attack':        (40, 21, None, 'attack', 'log_continuous', (0.001, 5.0, 1.02)),             # GPIO21, GPIO9
-    'decay':         (19, 23, None,  'decay', 'log_continuous', (0.01, 5.0, 1.02)),             # GPIO10, GPIO11
-    'sustain':       (8, 10, None, 'sustain', 'continuous', (0.0, 1.0, 0.01)),                 # GPIO14(TXD), GPIO15(RXD) - If Serial disabled
-    'release':       (12, 24, None, 'release', 'log_continuous', (0.01, 8.0, 1.02)),               # GPIO18(PCM_CLK), GPIO8(SPI_CE0) - If PCM/SPI0 disabled
+    'osc_type':      (12, 16, None, 'osc_type', 'options', ['saw', 'square', 'sine', 'triangle']), # GPIO5, GPIO6
+    'chorus_amount': (18, 22, None, 'chorus_depth', 'continuous', (0.0, 0.02, 0.0005)),           # GPIO13, GPIO19 (Controls depth, Rate fixed or another encoder)
+    'volume':        (3, 5, 7, 'volume', 'continuous_toggle_func', (0.0, 1.0, 0.01), 'toggle_volume_mute'), # GPIO26, GPIO16, GPIO20
+    'arp_rate_enc':  (11, 13, 15, 'arp_rate', 'options_toggle_param', [4, 8, 16, 32], 'arp_on'), # GPIO25, GPIO24, GPIO23
+    'cutoff':        (24, 26, None, 'filter_cutoff', 'log_continuous', (20.0, 18000.0, 1.05)),     # GPIO22, GPIO27
+    'resonance':     (36, 32, None, 'filter_resonance', 'continuous', (0.0, 0.95, 0.01)),         # GPIO17, GPIO4
+    'env_amount':    (38, 40, None, 'filter_env_amount', 'continuous', (-8000.0, 8000.0, 100.0)),   # GPIO3, GPIO2
+    'attack':        (19 , 21, None, 'attack', 'log_continuous', (0.001, 5.0, 1.02)),             # GPIO21, GPIO9
+    'decay':         (23, 29, None,  'decay', 'log_continuous', (0.01, 5.0, 1.02)),             # GPIO10, GPIO11
+    'sustain':       (31, 33, None, 'sustain', 'continuous', (0.0, 1.0, 0.01)),                 # GPIO14(TXD), GPIO15(RXD) - If Serial disabled
+    'release':       (35, 37, None, 'release', 'log_continuous', (0.01, 8.0, 1.02)),               # GPIO18(PCM_CLK), GPIO8(SPI_CE0) - If PCM/SPI0 disabled
 }
 
 # --- Rotary Encoder Class ---
