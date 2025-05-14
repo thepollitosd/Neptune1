@@ -19,8 +19,6 @@ except RuntimeError:
     RPI_GPIO_AVAILABLE = False
     print("Error importing RPi.GPIO (may need sudo or not on RPi). Encoder functionality disabled.", file=sys.stderr)
 
-
-# --- Default Parameters ---
 DEFAULT_PARAMS = {
     'osc_type': 'saw', 'attack': 0.01, 'decay': 0.2, 'sustain': 0.8, 'release': 0.3,
     'filter_cutoff': 5000, 'filter_resonance': 0.1, 'filter_env_amount': 0,
@@ -30,11 +28,8 @@ DEFAULT_PARAMS = {
     'arp_pattern': 'Up', 'arp_octaves': 1,
 }
 
-# --- Presets (REPLACE WITH YOUR 150 PRESETS) ---
 PRESETS = {
-    "Default": DEFAULT_PARAMS.copy(),
-    "Pad: MW Pad": { 'osc_type': 'saw', 'attack': 0.8, 'decay': 1.5, 'sustain': 0.6, 'release': 1.8, 'filter_cutoff': 3800, 'filter_resonance': 0.1, 'filter_env_amount': 800, 'volume': 0.5, 'analog_drive': 1.5, 'analog_drift':0.0005, 'chorus_depth': 0.008, 'chorus_rate': 0.6, 'arp_on': False, 'arp_bpm': 120.0, 'arp_rate': 16, 'arp_pattern': 'Up', 'arp_octaves': 1},
-    # --- ADD YOUR OTHER PRESETS HERE ---
+    "Default": DEFAULT_PARAMS.copy()
 }
 
 # --- Helper Functions ---
