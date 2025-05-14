@@ -132,5 +132,3 @@ Follow these steps on your Raspberry Pi's terminal:
     *   Make sure `python3-rpi.gpio` is installed correctly.
     *   You might need to run the script with `sudo`.
     *   Ensure your user is part of the `gpio` group (`sudo usermod -a -G gpio your_username`, then log out and back in).
-
-Enjoy your Raspberry Pi synthesizer!
