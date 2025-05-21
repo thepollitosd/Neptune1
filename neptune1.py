@@ -269,8 +269,11 @@ class PySynthJunoMIDI:
                 if not voices_to_process: outdata[:] = buffer; return
                 for voice in voices_to_process:
                     if voice.is_active():
-                        try: voice_output = voice.process(frames); buffer[:, 0] += voice_output;
-                        if voice.is_active(): active_voices_next.append(voice)
+                        try: 
+                            voice_output = voice.process(frames); 
+                            buffer[:, 0] += voice_output;
+                            if voice.is_active():
+                                active_voices_next.append(voice)
                         except Exception as e: print(f"ERR voice {voice.note}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
                 self.voices = active_voices_next
             try: buffer[:, 0] = self._apply_master_chorus(buffer[:, 0])
@@ -452,8 +455,9 @@ class RotaryEncoder:
                 print(f"Encoder '{self.param_name}' (CLK:{self.clk_pin}) -> {self.param_name}: {display_val}")
         except Exception as e: print(f"Error update param {self.param_name}: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
     def cleanup(self):
-        try: GPIO.remove_event_detect(self.clk_pin)
-        if self.sw_pin is not None: GPIO.remove_event_detect(self.sw_pin)
+        try: 
+            GPIO.remove_event_detect(self.clk_pin)
+            if self.sw_pin is not None: GPIO.remove_event_detect(self.sw_pin)
         except Exception: pass
 
 # --- MIDI Input Thread ---
@@ -475,18 +479,29 @@ def midi_listener(synth_instance, port_name):
             if not midi_thread_running: break
         except (OSError, IOError, mido.MidiError) as e:
             print(f"MIDI Port Error: {e}. Retrying...", file=sys.stderr)
-            if midi_port and not midi_port.closed: try: midi_port.close()
-            except Exception: pass; midi_port = None
-            for _ in range(20): time.sleep(0.1);  if not midi_thread_running: break
-            if not midi_thread_running: break
+            if midi_port and not midi_port.closed: 
+                try: 
+                    midi_port.close()
+                except Exception: 
+                    pass; 
+                    midi_port = None
+            for i in range(20): 
+                time.sleep(0.1);
+            if not midi_thread_running: 
+                break
+            if not midi_thread_running: 
+                break
         except Exception as e:
             print(f"Unexpected MIDI listener error: {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
-            if midi_port and not midi_port.closed: try: midi_port.close()
-            except Exception: pass; midi_port = None
-            for _ in range(50): time.sleep(0.1); if not midi_thread_running: break
+            if midi_port and not midi_port.closed: 
+                try: midi_port.close()
+                except Exception: pass; midi_port = None
+            for _ in range(50): time.sleep(0.1); 
+            if not midi_thread_running: break
             if not midi_thread_running: break
         if midi_port and midi_port.closed: print(f"MIDI port '{port_name}' closed."); midi_port = None
-    if midi_port and not midi_port.closed: print("Closing MIDI from thread exit..."); try: midi_port.close()
+    if midi_port and not midi_port.closed: print("Closing MIDI from thread exit..."); 
+    try: midi_port.close()
     except Exception: pass
     print("MIDI thread finished.")
 
@@ -531,7 +546,9 @@ if __name__ == "__main__":
         with self_synth.lock:
             if not self_synth.is_volume_muted: self_synth._stored_volume = self_synth.params['volume']; self_synth.params['volume'] = 0.0; self_synth.is_volume_muted = True; print("Volume Muted")
             else: self_synth.params['volume'] = self_synth._stored_volume; self_synth.is_volume_muted = False; print(f"Volume Unmuted: {self_synth.params['volume']:.2f}")
-            params_copy = self_synth.params.copy(); [v.params = params_copy.copy() for v in self_synth.voices]
+            params_copy = self_synth.params.copy();
+            for v in self_synth.voices:
+                v.params = params_copy.copy()
             self_synth.current_preset_name = self_synth._find_preset_name(self_synth.params)
     SYNTH_INSTANCE.toggle_volume_mute = lambda: _synth_toggle_volume_mute_method(SYNTH_INSTANCE)
 
@@ -577,8 +594,9 @@ if __name__ == "__main__":
         print("Cleaning up..."); midi_thread_running = False
         if MIDI_THREAD_INSTANCE and MIDI_THREAD_INSTANCE.is_alive():
             print("Stopping MIDI thread...");
-            if midi_port and not midi_port.closed: try: midi_port.close()
-            except Exception: pass
+            if midi_port and not midi_port.closed:
+                try: midi_port.close()
+                except Exception: pass
             MIDI_THREAD_INSTANCE.join(timeout=0.5)
             if MIDI_THREAD_INSTANCE.is_alive(): print("Warn: MIDI thread join timed out.", file=sys.stderr)
         if SYNTH_INSTANCE: SYNTH_INSTANCE.close()
