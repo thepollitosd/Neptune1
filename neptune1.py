@@ -202,7 +202,9 @@ class PySynthJunoMIDI:
                 self._stored_volume = self.params['volume']; self.params['volume'] = 0.0; self.is_volume_muted = True; print("Volume Muted")
             else:
                 self.params['volume'] = self._stored_volume; self.is_volume_muted = False; print(f"Volume Unmuted: {self.params['volume']:.2f}")
-            params_copy = self.params.copy(); [v.params = params_copy.copy() for v in self.voices]
+            params_copy = self.params.copy()
+            for v in self.voices:
+                v.params = params_copy.copy()
             self.current_preset_name = self._find_preset_name(self.params)
 
     def toggle_chorus(self): # Called by encoder if switch is defined for chorus_amount
